@@ -1,20 +1,17 @@
 """
-Crazyflie L-shape flight with concurrent Occupancy Grid Mapping (OGM).
+Crazyflie Gaussian-goal landing with concurrent Occupancy Grid Mapping (OGM).
 
 Purpose
 -------
-Measure the Kalman/Flow-deck pose drift over a known L-shape commanded path.
 Sequence per session:
   1. User presses Connect: SyncCrazyflie opens, RangePoseReader streams
      sensor + state data into the GUI. No motors run.
   2. User sets map W x H, start (sx, sy), goal (gx, gy) in *world* meters,
      and target flight height.
-  3. User presses Start L-shape Flight:
-       takeoff -> phase 1 (move along +x or -x) -> phase 2 (move along +y
-       or -y) -> land. No reactive obstacle avoidance. Only a 4-ranger
-       safety brake at 10 cm.
-  4. After landing, the GUI shows (commanded drone-frame target) vs
-     (Kalman drone-frame final pose). Difference = drift estimate.
+  3. User presses Start Goal Landing:
+       takeoff -> choose a clear landing cell inside the goal Gaussian ->
+       seek it while avoiding obstacles -> land.
+  4. After landing, the GUI shows goal mean vs Kalman final pose error.
   5. While flying, Multi-ranger F/L/R/B beams are ray-cast into an
      occupancy grid and visualised in the GUI.
 
@@ -27,8 +24,10 @@ Assumptions
 """
 
 import argparse
+import csv
 import logging
 import math
+from pathlib import Path
 import signal
 import sys
 import threading
@@ -59,13 +58,31 @@ from cflib.utils import uri_helper
 URI = uri_helper.uri_from_env(default="radio://0/80/2M/E7E7E7E7E5")
 
 TARGET_HEIGHT = 0.40
-SPEED_X = 0.15
-SPEED_Y = 0.15
+SPEED_X = 0.3
+SPEED_Y = 0.2
 ARRIVAL_RADIUS = 0.10            # axis 도착 판정 반경
+
+# Goal distribution / landing search
+GOAL_SIGMA = 0.30                # goal point 주변 Gaussian 표준편차
+GOAL_SEARCH_RADIUS = 0.75        # landing 후보를 찾을 최대 반경
+LANDING_CLEAR_RADIUS = 0.18      # 착륙 후보 주변 장애물 여유 반경
+LANDING_OCCUPIED_LIMIT = 0.75    # 이 log-odds 이상이면 landing 후보 제외
+LANDING_Z_DELTA = 0.045          # 주변 바닥 대비 zrange 변화량
+LANDING_Z_STEP_DELTA = 0.025     # 이전 스텝 대비 zrange 급변 감지 기준
+LANDING_Z_STABLE_COUNT = 3       # landing 높이 후보 연속 검출 횟수
+LANDING_START_RADIUS = 0.15      # goal 평균점에 이만큼 접근한 뒤 착륙 탐색 시작
+GOAL_SCAN_RADIUS = 0.35          # 분포 내부 z-search 순회 반경
+GOAL_SCAN_SPEED = 0.08
 
 # Safety: 4 ranger 10 cm 유지
 SAFETY_DIST = 0.10
+LANDING_DESCENT_MIN_DIST = 0.12  # goal 내부 착륙 하강을 허용할 최소 수평 거리
 SAFETY_BRAKE_DIST = 0.25         # 25cm 안으로 들어오면 비례 감속 시작
+FRONT_AVOID_DIST = 0.35          # front가 이보다 가까우면 좌/우 회피
+SIDE_RETURN_DIST = 0.18          # 선택한 side가 가까워지면 goal 분포로 복귀
+SIDE_STEP_SPEED = 0.12
+GOAL_SEEK_SPEED = 0.16
+SIDE_AVOID_MAX_S = 2.0
 
 # OGM
 MAP_RESOLUTION = 0.10
@@ -92,6 +109,7 @@ TAKEOFF_STEP_S = 0.08
 LANDING_STEP_M = 0.02
 LANDING_STEP_S = 0.10
 OUT_OF_RANGE_MM = 4000
+SENSOR_LOG_DIR = Path("logs")
 
 logging.basicConfig(level=logging.ERROR)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -211,6 +229,26 @@ def send_velocity_limited(cf, vx, vy, rh, max_h=MAX_HEIGHT_COMMAND):
     return h, vx_l, vy_l
 
 
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def gaussian_weight(x, y, mean_xy, sigma=GOAL_SIGMA):
+    if sigma <= 0:
+        return 1.0 if (x, y) == tuple(mean_xy) else 0.0
+    dx = x - mean_xy[0]
+    dy = y - mean_xy[1]
+    return math.exp(-0.5 * (dx * dx + dy * dy) / (sigma * sigma))
+
+
+def goal_distribution_threshold():
+    return gaussian_weight(GOAL_SIGMA, 0.0, (0.0, 0.0))
+
+
+def in_goal_distribution(x, y, goal_xy):
+    return gaussian_weight(x, y, goal_xy) >= goal_distribution_threshold()
+
+
 # ===========================================================================
 # Occupancy Grid Map (log-odds, ray-cast)
 # ===========================================================================
@@ -322,6 +360,63 @@ class OccupancyGrid:
         with self.lock:
             return self.log_odds.copy()
 
+    def cell_center(self, row, col):
+        return (col + 0.5) * self.res, (row + 0.5) * self.res
+
+    def is_landing_clear(self, x, y, clear_radius=LANDING_CLEAR_RADIUS):
+        """Return True when the local OGM patch has no likely occupied cells."""
+        row, col = self.world_to_cell(x, y)
+        radius_cells = max(1, int(math.ceil(clear_radius / self.res)))
+        with self.lock:
+            for rr in range(row - radius_cells, row + radius_cells + 1):
+                for cc in range(col - radius_cells, col + radius_cells + 1):
+                    if not self.in_bounds(rr, cc):
+                        return False
+                    cx, cy = self.cell_center(rr, cc)
+                    if math.hypot(cx - x, cy - y) > clear_radius:
+                        continue
+                    if self.log_odds[rr, cc] >= LANDING_OCCUPIED_LIMIT:
+                        return False
+        return True
+
+    def best_landing_target(self, goal_xy):
+        """
+        Pick a landing cell inside the Gaussian goal region.
+
+        The score favors cells near the goal mean and cells observed as free.
+        Occupied cells, map edges, and cells without enough clearance are rejected.
+        """
+        best = None
+        best_score = -float("inf")
+        search_cells = max(1, int(math.ceil(GOAL_SEARCH_RADIUS / self.res)))
+        grow, gcol = self.world_to_cell(*goal_xy)
+        with self.lock:
+            log_odds = self.log_odds.copy()
+
+        for row in range(grow - search_cells, grow + search_cells + 1):
+            for col in range(gcol - search_cells, gcol + search_cells + 1):
+                if not self.in_bounds(row, col):
+                    continue
+                x, y = self.cell_center(row, col)
+                dist = math.hypot(x - goal_xy[0], y - goal_xy[1])
+                if dist > GOAL_SEARCH_RADIUS:
+                    continue
+                lo = float(log_odds[row, col])
+                if lo >= LANDING_OCCUPIED_LIMIT:
+                    continue
+                if not self.is_landing_clear(x, y):
+                    continue
+
+                goal_score = gaussian_weight(x, y, goal_xy)
+                free_bonus = clamp(-lo / abs(LOG_ODDS_MIN), 0.0, 1.0)
+                unknown_penalty = 0.10 if abs(lo) < 0.05 else 0.0
+                score = goal_score + 0.35 * free_bonus - unknown_penalty
+                if score > best_score:
+                    best_score = score
+                    best = (x, y)
+
+        return best if best is not None else tuple(goal_xy)
+
 
 # ===========================================================================
 # Range + Pose Reader  (Multi-ranger + Kalman state)
@@ -339,8 +434,8 @@ class RangePoseReader:
         self._lock = threading.Lock()
         self._latest = {
             "front": None, "left": None, "right": None, "back": None,
-            "up": None, "zrange": None, "vbat": None,
-            "x": None, "y": None, "yaw": None,
+            "up": None, "zrange": None, "zrange_raw": None, "vbat": None,
+            "x": None, "y": None, "z": None, "yaw": None,
         }
         self._range_log = None
         self._state_log = None
@@ -362,6 +457,7 @@ class RangePoseReader:
         sl = LogConfig(name="Pose", period_in_ms=LOG_PERIOD_MS)
         sl.add_variable("stateEstimate.x", "float")
         sl.add_variable("stateEstimate.y", "float")
+        sl.add_variable("stateEstimate.z", "float")
         sl.add_variable("stateEstimate.yaw", "float")
         self._cf.log.add_config(sl)
         sl.data_received_cb.add_callback(self._state_cb)
@@ -383,18 +479,20 @@ class RangePoseReader:
         self._state_log = None
 
     def _range_cb(self, _ts, data, _conf):
+        zrange_raw = mm_to_m(data.get("range.zrange"))
         raw = {
             "front":  mm_to_m(data.get("range.front")),
             "left":   mm_to_m(data.get("range.left")),
             "right":  mm_to_m(data.get("range.right")),
             "back":   mm_to_m(data.get("range.back")),
             "up":     mm_to_m(data.get("range.up")),
-            "zrange": mm_to_m(data.get("range.zrange")),
+            "zrange": zrange_raw,
+            "zrange_raw": zrange_raw,
             "vbat":   data.get("pm.vbat"),
         }
         with self._lock:
             for k, v in raw.items():
-                if k == "vbat":
+                if k in ("vbat", "zrange_raw"):
                     self._latest[k] = v
                     continue
                 prev = self._latest.get(k)
@@ -411,6 +509,7 @@ class RangePoseReader:
         with self._lock:
             self._latest["x"] = data.get("stateEstimate.x")
             self._latest["y"] = data.get("stateEstimate.y")
+            self._latest["z"] = data.get("stateEstimate.z")
             self._latest["yaw"] = data.get("stateEstimate.yaw")  # degrees
 
     def snapshot(self):
@@ -434,6 +533,7 @@ if PYQT_AVAILABLE:
         status_text = QtCore.pyqtSignal(str)
         connection_state = QtCore.pyqtSignal(str)
         flight_result = QtCore.pyqtSignal(dict)
+        landing_found = QtCore.pyqtSignal(float, float)
 
         def __init__(self):
             super().__init__()
@@ -442,6 +542,8 @@ if PYQT_AVAILABLE:
             self.start_xy = DEFAULT_START
             self.goal_xy = DEFAULT_GOAL
             self.target_height = TARGET_HEIGHT
+            self._landing_found_world = None
+            self._sensor_log_path = None
 
             self._quit = False
             self._disconnect_request = False
@@ -471,6 +573,7 @@ if PYQT_AVAILABLE:
             self.start_xy = start_xy
             self.goal_xy = goal_xy
             self.target_height = target_height
+            self._landing_found_world = None
             self._land_request = False
             self._estop_request = False
             # 매핑 중이 아닐 때만 Kalman 재리셋 (매핑 중이면 이미 정렬된 좌표계 유지)
@@ -631,42 +734,405 @@ if PYQT_AVAILABLE:
 
         # ---- flight execution ----
         def _execute_flight(self, cf):
-            """Takeoff → x phase → y phase → land. No reactive avoidance."""
+            """Takeoff -> Gaussian goal-region seek with reactive side avoidance."""
+            log_file, log_writer = self._open_sensor_log()
             self.status_text.emit("Takeoff")
             reset_height_limiter(0.0)
             reset_velocity_limiter(0.0, 0.0)
             h = 0.0
-            while h < self.target_height:
-                if self._land_request or self._estop_request:
-                    break
-                h = min(self.target_height, h + TAKEOFF_STEP_M)
-                cf.commander.send_hover_setpoint(0, 0, 0, h)
-                time.sleep(TAKEOFF_STEP_S)
-            reset_height_limiter(h)
-            time.sleep(0.5)
+            try:
+                while h < self.target_height:
+                    if self._land_request or self._estop_request:
+                        break
+                    h = min(self.target_height, h + TAKEOFF_STEP_M)
+                    cf.commander.send_hover_setpoint(0, 0, 0, h)
+                    if self._reader is not None:
+                        self._write_sensor_log(
+                            log_writer,
+                            phase="takeoff",
+                            mode="takeoff",
+                            snap=self._reader.snapshot(),
+                            height_cmd=h,
+                        )
+                    time.sleep(TAKEOFF_STEP_S)
+                reset_height_limiter(h)
+                time.sleep(0.5)
 
+                path_log = []
+                completed = False
+                if not (self._land_request or self._estop_request):
+                    completed = self._seek_goal_distribution(cf, path_log, log_writer)
+
+                if self._land_request or self._estop_request:
+                    status = "aborted"
+                else:
+                    status = "completed" if completed else "timeout"
+                return self._finalize(cf, path_log, status)
+            finally:
+                if log_file is not None:
+                    try:
+                        log_file.flush()
+                        log_file.close()
+                    except Exception:
+                        pass
+
+        def _seek_goal_distribution(self, cf, path_log, log_writer=None):
             start_world = tuple(self.start_xy)
             goal_world = tuple(self.goal_xy)
-            dx_total = goal_world[0] - start_world[0]
-            dy_total = goal_world[1] - start_world[1]
-
-            path_log = []
+            last_map_emit = 0.0
+            last_target_update = 0.0
+            landing_target = goal_world
+            mode = "seek_goal"
+            return_mode = "seek_goal"
+            side_sign = 0.0
+            side_started = 0.0
+            z_floor_ref = None
+            prev_zrange_raw = None
+            z_edge_count = 0
+            z_candidate_count = 0
+            clear_landing_count = 0
+            scan_points = self._goal_scan_points(goal_world)
+            scan_index = 0
+            flight_started = time.time()
+            max_flight_s = 180.0
 
             self.status_text.emit(
-                f"Phase 1 (x): dx = {dx_total:+.2f} m"
+                f"Seeking Gaussian goal region: mean=({goal_world[0]:.2f}, {goal_world[1]:.2f}), "
+                f"sigma={GOAL_SIGMA:.2f} m"
             )
-            self._move_axis(cf, axis="x", delta=dx_total,
-                            path_log=path_log, world_origin=start_world)
 
-            if not (self._land_request or self._estop_request):
-                self.status_text.emit(
-                    f"Phase 2 (y): dy = {dy_total:+.2f} m"
+            while True:
+                if self._land_request or self._estop_request:
+                    return False
+                if time.time() - flight_started > max_flight_s:
+                    self.status_text.emit("Goal seek timeout")
+                    return False
+
+                snap = self._reader.snapshot()
+                cur_x = snap.get("x")
+                cur_y = snap.get("y")
+                cur_yaw = snap.get("yaw") or 0.0
+                yaw_rad = math.radians(cur_yaw)
+                if cur_x is None or cur_y is None:
+                    cf.commander.send_hover_setpoint(0, 0, 0, self.target_height)
+                    time.sleep(CONTROL_DT)
+                    continue
+
+                world_x = start_world[0] + cur_x
+                world_y = start_world[1] + cur_y
+                dist_to_goal_mean = math.hypot(
+                    goal_world[0] - world_x,
+                    goal_world[1] - world_y,
                 )
-                self._move_axis(cf, axis="y", delta=dy_total,
-                                path_log=path_log, world_origin=start_world)
 
-            status = "aborted" if (self._land_request or self._estop_request) else "completed"
-            return self._finalize(cf, path_log, status)
+                if self.ogm is not None:
+                    self.ogm.update_from_ranges(world_x, world_y, yaw_rad, {
+                        "front": snap.get("front"),
+                        "left":  snap.get("left"),
+                        "right": snap.get("right"),
+                        "back":  snap.get("back"),
+                    })
+                    now = time.time()
+                    if now - last_map_emit > 0.1:
+                        self.map_changed.emit()
+                        last_map_emit = now
+                    if mode != "seek_goal" and now - last_target_update > 0.4:
+                        landing_target = self.ogm.best_landing_target(goal_world)
+                        last_target_update = now
+
+                inside_goal_distribution = in_goal_distribution(
+                    world_x, world_y, goal_world
+                )
+                zrange = snap.get("zrange")
+                zrange_raw = snap.get("zrange_raw") or zrange
+                if zrange_raw is not None and not inside_goal_distribution:
+                    if z_floor_ref is None:
+                        z_floor_ref = zrange_raw
+                    else:
+                        z_floor_ref = 0.98 * z_floor_ref + 0.02 * zrange_raw
+
+                if mode == "seek_goal":
+                    landing_target = goal_world
+
+                if (
+                    inside_goal_distribution and
+                    dist_to_goal_mean <= LANDING_START_RADIUS and
+                    mode != "search_landing"
+                ):
+                    mode = "search_landing"
+                    side_sign = 0.0
+                    z_candidate_count = 0
+                    self.status_text.emit("Inside goal distribution: landing has priority")
+
+                if mode == "search_landing":
+                    landing_target = scan_points[scan_index]
+                    if math.hypot(landing_target[0] - world_x, landing_target[1] - world_y) <= ARRIVAL_RADIUS:
+                        scan_index = (scan_index + 1) % len(scan_points)
+                        landing_target = scan_points[scan_index]
+
+                dx = landing_target[0] - world_x
+                dy = landing_target[1] - world_y
+                dist = math.hypot(dx, dy)
+                landing_clear = (
+                    self.ogm is None or self.ogm.is_landing_clear(world_x, world_y)
+                )
+                descent_clear = self._is_descent_clear(snap)
+                if mode == "search_landing" and (landing_clear or descent_clear):
+                    clear_landing_count += 1
+                else:
+                    clear_landing_count = 0
+
+                z_step = None
+                if zrange_raw is not None and prev_zrange_raw is not None:
+                    z_step = zrange_raw - prev_zrange_raw
+                z_edge = (
+                    mode == "search_landing" and
+                    z_step is not None and
+                    abs(z_step) >= LANDING_Z_STEP_DELTA
+                )
+                if (
+                    mode == "search_landing" and
+                    self._is_landing_height_candidate(zrange_raw, z_floor_ref, z_edge)
+                ):
+                    z_candidate_count += 1
+                    if z_edge:
+                        z_edge_count += 1
+                else:
+                    z_candidate_count = max(0, z_candidate_count - 1)
+
+                if (
+                    mode == "search_landing" and
+                    z_candidate_count >= LANDING_Z_STABLE_COUNT and
+                    z_edge_count >= 1 and
+                    (landing_clear or descent_clear)
+                ):
+                    self._landing_found_world = (world_x, world_y)
+                    self.landing_found.emit(world_x, world_y)
+                    cf.commander.send_hover_setpoint(0, 0, 0, self.target_height)
+                    self.status_text.emit(
+                        f"Landing z-height found: ({world_x:.2f}, {world_y:.2f})"
+                    )
+                    return True
+
+                front = snap.get("front")
+                if mode == "seek_goal" and front is not None and front < FRONT_AVOID_DIST:
+                    side_sign = self._choose_side_direction(snap)
+                    if side_sign != 0.0:
+                        return_mode = mode
+                        mode = "side_avoid"
+                        side_started = time.time()
+                        label = "left" if side_sign > 0 else "right"
+                        self.status_text.emit(f"Front obstacle: sidestep {label}")
+
+                if mode == "side_avoid":
+                    selected_side = snap.get("left") if side_sign > 0 else snap.get("right")
+                    timed_out = time.time() - side_started >= SIDE_AVOID_MAX_S
+                    side_close = selected_side is not None and selected_side <= SIDE_RETURN_DIST
+                    front_clear = front is None or front > FRONT_AVOID_DIST + 0.10
+                    if side_close or (timed_out and front_clear):
+                        mode = return_mode
+                        side_sign = 0.0
+                        self.status_text.emit("Returning to landing search")
+
+                if mode == "side_avoid":
+                    vx = 0.0
+                    vy = side_sign * SIDE_STEP_SPEED
+                else:
+                    max_speed = GOAL_SCAN_SPEED if mode == "search_landing" else GOAL_SEEK_SPEED
+                    speed = min(max_speed, max(0.04, dist))
+                    if dist > 1e-6:
+                        vx = clamp(dx / dist * speed, -max_speed, max_speed)
+                        vy = clamp(dy / dist * speed, -max_speed, max_speed)
+                    else:
+                        vx = 0.0
+                        vy = 0.0
+
+                vx, vy, throttled = self._apply_safety(snap, vx, vy)
+                _hc, c_vx, c_vy = send_velocity_limited(
+                    cf, vx, vy, self.target_height
+                )
+                path_log.append({
+                    "t": time.time(),
+                    "mode": mode,
+                    "cur_x": cur_x, "cur_y": cur_y, "yaw": cur_yaw,
+                    "world_x": world_x, "world_y": world_y,
+                    "target_x": landing_target[0], "target_y": landing_target[1],
+                    "zrange": zrange, "zrange_raw": zrange_raw,
+                    "z_step": z_step, "z_floor_ref": z_floor_ref,
+                    "z_candidate_count": z_candidate_count,
+                    "z_edge_count": z_edge_count,
+                    "clear_landing_count": clear_landing_count,
+                    "descent_clear": descent_clear,
+                    "vx_cmd": c_vx, "vy_cmd": c_vy,
+                    "throttled": throttled,
+                })
+                self._write_sensor_log(
+                    log_writer,
+                    phase="flight",
+                    mode=mode,
+                    snap=snap,
+                    world_x=world_x,
+                    world_y=world_y,
+                    target_x=landing_target[0],
+                    target_y=landing_target[1],
+                    height_cmd=self.target_height,
+                    vx_cmd=c_vx,
+                    vy_cmd=c_vy,
+                    landing_clear=landing_clear,
+                    descent_clear=descent_clear,
+                    clear_landing_count=clear_landing_count,
+                    inside_goal=inside_goal_distribution,
+                    z_floor_ref=z_floor_ref,
+                    z_step=z_step,
+                    z_edge=z_edge,
+                    z_candidate_count=z_candidate_count,
+                    z_edge_count=z_edge_count,
+                    scan_index=scan_index,
+                    throttled=throttled,
+                )
+                self.sensor_updated.emit(snap)
+                if zrange_raw is not None:
+                    prev_zrange_raw = zrange_raw
+                time.sleep(CONTROL_DT)
+
+        def _open_sensor_log(self):
+            try:
+                SENSOR_LOG_DIR.mkdir(parents=True, exist_ok=True)
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                path = SENSOR_LOG_DIR / f"ogm_sensor_{stamp}.csv"
+                log_file = path.open("w", newline="", encoding="utf-8", buffering=1)
+                fields = [
+                    "time_s", "phase", "mode",
+                    "x", "y", "z", "yaw",
+                    "world_x", "world_y",
+                    "target_x", "target_y",
+                    "front", "left", "right", "back", "up",
+                    "zrange", "zrange_raw", "z_step", "z_floor_ref",
+                    "vbat", "height_cmd", "vx_cmd", "vy_cmd",
+                    "inside_goal", "landing_clear", "z_edge",
+                    "descent_clear", "clear_landing_count",
+                    "z_candidate_count", "z_edge_count", "scan_index",
+                    "throttled",
+                ]
+                writer = csv.DictWriter(log_file, fieldnames=fields)
+                writer.writeheader()
+                self._sensor_log_path = str(path)
+                self.status_text.emit(f"Sensor logging: {path}")
+                return log_file, writer
+            except Exception as exc:
+                self._sensor_log_path = None
+                self.status_text.emit(f"Sensor log disabled: {exc}")
+                return None, None
+
+        def _write_sensor_log(self, writer, phase, mode, snap, **extra):
+            if writer is None:
+                return
+            row = {
+                "time_s": time.time(),
+                "phase": phase,
+                "mode": mode,
+                "x": snap.get("x"),
+                "y": snap.get("y"),
+                "z": snap.get("z"),
+                "yaw": snap.get("yaw"),
+                "world_x": extra.get("world_x"),
+                "world_y": extra.get("world_y"),
+                "target_x": extra.get("target_x"),
+                "target_y": extra.get("target_y"),
+                "front": snap.get("front"),
+                "left": snap.get("left"),
+                "right": snap.get("right"),
+                "back": snap.get("back"),
+                "up": snap.get("up"),
+                "zrange": snap.get("zrange"),
+                "zrange_raw": snap.get("zrange_raw"),
+                "z_step": extra.get("z_step"),
+                "z_floor_ref": extra.get("z_floor_ref"),
+                "vbat": snap.get("vbat"),
+                "height_cmd": extra.get("height_cmd"),
+                "vx_cmd": extra.get("vx_cmd"),
+                "vy_cmd": extra.get("vy_cmd"),
+                "inside_goal": extra.get("inside_goal"),
+                "landing_clear": extra.get("landing_clear"),
+                "z_edge": extra.get("z_edge"),
+                "descent_clear": extra.get("descent_clear"),
+                "clear_landing_count": extra.get("clear_landing_count"),
+                "z_candidate_count": extra.get("z_candidate_count"),
+                "z_edge_count": extra.get("z_edge_count"),
+                "scan_index": extra.get("scan_index"),
+                "throttled": extra.get("throttled"),
+            }
+            try:
+                writer.writerow(row)
+            except Exception:
+                pass
+
+        def _goal_scan_points(self, goal_world):
+            radius = min(GOAL_SCAN_RADIUS, GOAL_SEARCH_RADIUS, GOAL_SIGMA * 1.5)
+            offsets = [
+                (0.0, 0.0),
+                (radius, 0.0),
+                (0.0, radius),
+                (-radius, 0.0),
+                (0.0, -radius),
+                (radius * 0.7, radius * 0.7),
+                (-radius * 0.7, radius * 0.7),
+                (-radius * 0.7, -radius * 0.7),
+                (radius * 0.7, -radius * 0.7),
+            ]
+            points = []
+            for dx, dy in offsets:
+                x = clamp(goal_world[0] + dx, 0.0, self.ogm.width_m if self.ogm else goal_world[0] + dx)
+                y = clamp(goal_world[1] + dy, 0.0, self.ogm.height_m if self.ogm else goal_world[1] + dy)
+                if in_goal_distribution(x, y, goal_world):
+                    points.append((x, y))
+            return points or [tuple(goal_world)]
+
+        def _is_landing_height_candidate(self, zrange, z_floor_ref, z_edge=False):
+            if zrange is None:
+                return False
+            if z_edge:
+                return True
+            ref = z_floor_ref if z_floor_ref is not None else self.target_height
+            if ref is None or ref <= 0:
+                return False
+            return abs(zrange - ref) >= LANDING_Z_DELTA
+
+        def _choose_side_direction(self, snap):
+            """
+            Pick the shorter left/right ranger direction when it is still safe.
+            If the shorter side is already too close, fall back to the other side.
+            """
+            left = snap.get("left")
+            right = snap.get("right")
+            left_ok = left is None or left > SAFETY_BRAKE_DIST
+            right_ok = right is None or right > SAFETY_BRAKE_DIST
+
+            if left is None and right is None:
+                return 1.0
+            if left is None:
+                return -1.0 if right_ok else 0.0
+            if right is None:
+                return 1.0 if left_ok else 0.0
+
+            preferred = 1.0 if left <= right else -1.0
+            if preferred > 0 and left_ok:
+                return preferred
+            if preferred < 0 and right_ok:
+                return preferred
+            if left_ok:
+                return 1.0
+            if right_ok:
+                return -1.0
+            return 0.0
+
+        def _is_descent_clear(self, snap):
+            """Allow landing in the goal when no ranger reports immediate collision risk."""
+            for name in ("front", "left", "right", "back"):
+                dist = snap.get(name)
+                if dist is not None and dist < LANDING_DESCENT_MIN_DIST:
+                    return False
+            return True
 
         def _move_axis(self, cf, axis, delta, path_log, world_origin):
             if abs(delta) < 1e-3:
@@ -805,6 +1271,8 @@ if PYQT_AVAILABLE:
                 "error_x": error_x,
                 "error_y": error_y,
                 "error_norm": error_norm,
+                "landing_world": list(self._landing_found_world) if self._landing_found_world else None,
+                "sensor_log": self._sensor_log_path,
                 "samples": len(path_log),
             }
 
@@ -823,6 +1291,7 @@ if PYQT_AVAILABLE:
             self.drone_world = None
             self.start_world = None
             self.goal_world = None
+            self.landing_world = None
             self.path_world = []
             self.setMinimumSize(360, 480)
             self.setStyleSheet(
@@ -833,7 +1302,12 @@ if PYQT_AVAILABLE:
             self.ogm = ogm
             self.start_world = start_xy
             self.goal_world = goal_xy
+            self.landing_world = None
             self.path_world = []
+            self.update()
+
+        def set_landing_marker(self, world_x, world_y):
+            self.landing_world = (world_x, world_y)
             self.update()
 
         def update_drone(self, world_x, world_y):
@@ -962,14 +1436,24 @@ if PYQT_AVAILABLE:
                         color = QtGui.QColor(100, 180, 100, a)
                     p.fillRect(QtCore.QRectF(px, py, cell_w, cell_w), color)
 
-            # commanded L-path (start -> corner -> goal)
+            # commanded reference line (start -> goal mean)
             if self.start_world and self.goal_world:
                 p.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180, 160), 1, QtCore.Qt.DashLine))
                 sxs, sys_ = w2s(*self.start_world)
-                cx, cy = w2s(self.goal_world[0], self.start_world[1])  # L corner
                 gxs, gys = w2s(*self.goal_world)
-                p.drawLine(QtCore.QPointF(sxs, sys_), QtCore.QPointF(cx, cy))
-                p.drawLine(QtCore.QPointF(cx, cy), QtCore.QPointF(gxs, gys))
+                p.drawLine(QtCore.QPointF(sxs, sys_), QtCore.QPointF(gxs, gys))
+
+            # Gaussian goal distribution: 1-sigma filled area and search boundary.
+            if self.goal_world:
+                gxs, gys = w2s(*self.goal_world)
+                sigma_px = GOAL_SIGMA * scale
+                search_px = GOAL_SEARCH_RADIUS * scale
+                p.setBrush(QtGui.QColor(245, 158, 11, 42))
+                p.setPen(QtGui.QPen(QtGui.QColor(245, 158, 11, 150), 1.5))
+                p.drawEllipse(QtCore.QPointF(gxs, gys), sigma_px, sigma_px)
+                p.setBrush(QtCore.Qt.NoBrush)
+                p.setPen(QtGui.QPen(QtGui.QColor(245, 158, 11, 95), 1, QtCore.Qt.DashLine))
+                p.drawEllipse(QtCore.QPointF(gxs, gys), search_px, search_px)
 
             # measured trajectory
             if len(self.path_world) >= 2:
@@ -991,7 +1475,14 @@ if PYQT_AVAILABLE:
             if self.start_world:
                 marker(*self.start_world, color="#10b981", label="S")
             if self.goal_world:
-                marker(*self.goal_world, color="#f59e0b", label="G")
+                marker(*self.goal_world, color="#f59e0b", label="Gμ")
+
+            if self.landing_world:
+                sx, sy = w2s(*self.landing_world)
+                p.setPen(QtGui.QPen(QtGui.QColor("#dc2626"), 3))
+                p.drawLine(QtCore.QPointF(sx - 8, sy - 8), QtCore.QPointF(sx + 8, sy + 8))
+                p.drawLine(QtCore.QPointF(sx - 8, sy + 8), QtCore.QPointF(sx + 8, sy - 8))
+                p.drawText(QtCore.QPointF(sx + 10, sy - 8), "L")
 
             if self.drone_world:
                 sx, sy = w2s(*self.drone_world)
@@ -1008,7 +1499,7 @@ if PYQT_AVAILABLE:
     class MainWindow(QtWidgets.QWidget):
         def __init__(self, args):
             super().__init__()
-            self.setWindowTitle("Crazyflie OGM + L-shape Drift Test")
+            self.setWindowTitle("Crazyflie OGM + Gaussian Goal Landing")
             self.setStyleSheet(self._stylesheet())
 
             # widgets
@@ -1027,7 +1518,7 @@ if PYQT_AVAILABLE:
             self.goal_y_spin = self._spin(0.0, 10.0, DEFAULT_GOAL[1], 0.1)
             self.height_spin = self._spin(0.20, 0.80, args.target_height, 0.05)
 
-            self.start_btn = QtWidgets.QPushButton("Start L-shape Flight")
+            self.start_btn = QtWidgets.QPushButton("Start Goal Landing")
             self.land_btn = QtWidgets.QPushButton("Land")
             self.estop_btn = QtWidgets.QPushButton("Emergency Stop")
             self.estop_btn.setObjectName("dangerButton")
@@ -1070,6 +1561,7 @@ if PYQT_AVAILABLE:
             self.worker.status_text.connect(self.status_label.setText)
             self.worker.map_changed.connect(self.map_view.map_changed)
             self.worker.flight_result.connect(self.on_flight_result)
+            self.worker.landing_found.connect(self.map_view.set_landing_marker)
 
             self.connect_btn.clicked.connect(self.on_connect)
             self.disconnect_btn.clicked.connect(self.on_disconnect)
@@ -1207,7 +1699,7 @@ if PYQT_AVAILABLE:
             right = QtWidgets.QVBoxLayout()
             map_title = QtWidgets.QLabel(
                 "Occupancy Grid (top-down, drone forward = ↑)   "
-                "red=occupied · green=free · blue=path · dashed=L · x↑ red, y← green"
+                "red=occupied · green=free · blue=path · orange=goal distribution · x↑ red, y← green"
             )
             map_title.setStyleSheet("font-weight: 600; padding: 4px;")
             right.addWidget(map_title)
@@ -1267,6 +1759,7 @@ if PYQT_AVAILABLE:
         def on_reset_map(self):
             self.worker.request_reset_map()
             self.map_view.path_world = []
+            self.map_view.landing_world = None
             self.map_view.update()
 
         def on_land(self):
@@ -1319,11 +1812,20 @@ if PYQT_AVAILABLE:
             en = result.get("error_norm", 0.0)
             cd = result.get("commanded_drone", [0, 0])
             md = result.get("measured_drone", [0, 0])
+            lw = result.get("landing_world")
+            sensor_log = result.get("sensor_log")
+            landing_text = (
+                f"\nLanding world:      ({lw[0]:+.3f}, {lw[1]:+.3f}) m"
+                if lw else ""
+            )
+            log_text = f"\nSensor log: {sensor_log}" if sensor_log else ""
             text = (
                 f"Status:   {result.get('status', '?')}\n"
                 f"Cmd (drone-frame):  ({cd[0]:+.3f}, {cd[1]:+.3f}) m\n"
                 f"Meas (drone-frame): ({md[0]:+.3f}, {md[1]:+.3f}) m\n"
                 f"Error:    dx={ex:+.3f}  dy={ey:+.3f}   ||e||={en:.3f} m"
+                f"{landing_text}"
+                f"{log_text}"
             )
             self.error_label.setText(text)
 
@@ -1344,7 +1846,7 @@ def signal_handler(_sn, _fr):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Crazyflie L-shape OGM drift test"
+        description="Crazyflie OGM Gaussian-goal landing"
     )
     p.add_argument("--uri", default=URI)
     p.add_argument("--target-height", type=float, default=TARGET_HEIGHT)

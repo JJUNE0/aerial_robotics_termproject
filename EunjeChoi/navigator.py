@@ -15,6 +15,24 @@ def _passable(grid: np.ndarray, row: int, col: int) -> bool:
             grid[row, col] not in (OCCUPIED, INFLATED))
 
 
+def _passable_los(grid: np.ndarray, row: int, col: int) -> bool:
+    """Thick passability check used only for LOS pruning.
+
+    Checks the cell and its 8 neighbours so that a straight-line shortcut
+    is only accepted when the drone body — not just its centre — clears all
+    inflated zones.  INFLATION_RADIUS already adds DRONE_HALF_DIAGONAL around
+    each obstacle; one extra cell here guards against diagonal corner-cutting.
+    """
+    rows, cols = grid.shape
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            nr, nc = row + dr, col + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                if grid[nr, nc] in (OCCUPIED, INFLATED):
+                    return False
+    return True
+
+
 def astar(grid: np.ndarray,
           start: Tuple[int, int],
           goal: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
@@ -53,6 +71,11 @@ def astar(grid: np.ndarray,
                 nr, nc = r + dr, c + dc
                 if not _passable(grid, nr, nc):
                     continue
+                # Block diagonal moves through tight corners: both cardinal
+                # neighbours must also be free so the drone body doesn't clip.
+                if dr != 0 and dc != 0:
+                    if not _passable(grid, r + dr, c) or not _passable(grid, r, c + dc):
+                        continue
                 step = math.sqrt(2) if (dr != 0 and dc != 0) else 1.0
                 ng = g + step
                 if ng < g_score.get((nr, nc), float('inf')):
@@ -79,7 +102,7 @@ def simplify_path(path: List[Tuple[int, int]],
         err = dr - dc
         r, c = r0, c0
         while (r, c) != (r1, c1):
-            if not _passable(grid, r, c):
+            if not _passable_los(grid, r, c):
                 return False
             e2 = 2 * err
             if e2 > -dc:
@@ -88,7 +111,7 @@ def simplify_path(path: List[Tuple[int, int]],
             if e2 < dr:
                 err += dr
                 c += sc
-        return True
+        return _passable_los(grid, r1, c1)  # also verify endpoint
 
     simplified = [path[0]]
     i = 0
@@ -130,14 +153,19 @@ class FrontierNavigator:
         visited[sr, sc] = True
         best_col = sc
         best_row = sr
+        found = False
 
         while queue:
             r, c = queue.popleft()
-            if c > best_col:
-                best_col = c
-                best_row = r
-            elif c == best_col and abs(r - rows // 2) < abs(best_row - rows // 2):
-                best_row = r
+
+            # Only FREE cells count as valid destinations
+            if grid[r, c] == FREE and c > sc:
+                if not found or c > best_col or (
+                        c == best_col and
+                        abs(r - rows // 2) < abs(best_row - rows // 2)):
+                    best_col = c
+                    best_row = r
+                    found = True
 
             for dr in (-1, 0, 1):
                 for dc in (-1, 0, 1):
@@ -146,33 +174,45 @@ class FrontierNavigator:
                     nr, nc = r + dr, c + dc
                     if nc > limit_col:
                         continue
+                    # Traverse FREE and UNKNOWN — UNKNOWN gaps should not block
+                    # exploration toward confirmed-FREE cells ahead
                     if (0 <= nr < rows and 0 <= nc < cols and
                             not visited[nr, nc] and
-                            grid[nr, nc] == FREE):
+                            grid[nr, nc] not in (OCCUPIED, INFLATED)):
                         visited[nr, nc] = True
                         queue.append((nr, nc))
 
-        if best_col == sc:
-            return None   # no progress possible
+        if not found:
+            return None
 
         return self._occ.cell_to_world(best_row, best_col)
 
 
 class LawnmowerNavigator:
-    """Generates ㄹ-pattern waypoints for the landing region scan."""
+    """Generates column-wise (Y-sweep, +X advance) ㄹ-pattern waypoints.
+
+    Pattern: descend to y_min → advance +X → sweep +Y → advance +X → sweep -Y → …
+    """
 
     def generate(self, x_start: float, x_end: float,
                  y_min: float, y_max: float) -> List[Tuple[float, float]]:
         waypoints: List[Tuple[float, float]] = []
-        y = y_min
-        forward = True
-        while y <= y_max + 0.01:
-            if forward:
-                waypoints.append((x_start, y))
-                waypoints.append((x_end, y))
-            else:
-                waypoints.append((x_end, y))
-                waypoints.append((x_start, y))
-            y += config.SCAN_ROW_SPACING
-            forward = not forward
+
+        # First: drop to y_min at the region entry
+        waypoints.append((x_start, y_min))
+
+        x = x_start
+        going_up = True   # first Y-sweep is +Y
+
+        while x < x_end - 0.01:
+            x_next = min(x + config.SCAN_ROW_SPACING, x_end)
+            y_cur = y_min if going_up else y_max   # current edge (where we advance X)
+            y_far = y_max if going_up else y_min   # far edge (sweep target)
+
+            waypoints.append((x_next, y_cur))   # advance +X at current Y edge
+            waypoints.append((x_next, y_far))   # sweep Y to far edge
+
+            going_up = not going_up
+            x = x_next
+
         return waypoints

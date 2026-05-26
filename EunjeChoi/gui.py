@@ -88,14 +88,14 @@ class MissionGUI:
             f'Pos: ({x:5.2f}, {y:5.2f}, {z:5.2f})  Yaw: {yaw:6.1f}°'
         )
 
-        self._draw_occupancy(x, y)
+        self._draw_occupancy(x, y, shared.landing_target)
         self._draw_edges(shared)
 
         return []
 
     # ---------------------------------------------------------------- occupancy
 
-    def _draw_occupancy(self, drone_x: float, drone_y: float):
+    def _draw_occupancy(self, drone_x: float, drone_y: float, landing_target=None):
         ax = self._ax_occ
         ax.clear()
         ax.set_title('Occupancy Map', color='white', fontsize=10)
@@ -127,10 +127,57 @@ class MissionGUI:
         def wy_to_row(wy):
             return (wy - y_min) / res
 
-        # Drone marker
-        dc = wx_to_col(drone_x)
-        dr = wy_to_row(drone_y)
-        ax.plot(dc, dr, 'co', markersize=7, zorder=5)
+        # ---- Clip view to exact arena bounds (5 m × 3 m)
+        ax.set_xlim(wx_to_col(config.ekf_arena_x_min()),
+                    wx_to_col(config.ekf_arena_x_max()))
+        ax.set_ylim(wy_to_row(config.ekf_arena_y_min()),
+                    wy_to_row(config.ekf_arena_y_max()))
+
+        # Ticks in arena frame: (0,0) = arena bottom-left corner
+        # Arena coord i  →  EKF coord (i - TAKEOFF_PAD_X / _Y)
+        ax.set_xticks([wx_to_col(i - config.TAKEOFF_PAD_X)
+                       for i in range(int(config.ARENA_X) + 1)])
+        ax.set_xticklabels([str(i) for i in range(int(config.ARENA_X) + 1)],
+                           fontsize=7)
+        ax.set_xlabel('x (m)', color='white', fontsize=8)
+
+        ax.set_yticks([wy_to_row(i - config.TAKEOFF_PAD_Y)
+                       for i in range(int(config.ARENA_Y) + 1)])
+        ax.set_yticklabels([str(i) for i in range(int(config.ARENA_Y) + 1)],
+                           fontsize=7)
+        ax.set_ylabel('y (m)', color='white', fontsize=8)
+
+        # Drone marker (EKF pos → same col/row mapping)
+        ax.plot(wx_to_col(drone_x), wy_to_row(drone_y),
+                'co', markersize=7, zorder=5, label='Drone')
+
+        # Target marker — drawn only while navigating
+        target = self._shared.target_pos
+        if target is not None:
+            tx, ty = target
+            ax.plot(wx_to_col(tx), wy_to_row(ty),
+                    'rx', markersize=9, markeredgewidth=2, zorder=6,
+                    label='Target')
+            ax.annotate('', xy=(wx_to_col(tx), wy_to_row(ty)),
+                        xytext=(wx_to_col(drone_x), wy_to_row(drone_y)),
+                        arrowprops=dict(arrowstyle='->', color='red',
+                                        lw=1.2, alpha=0.7),
+                        zorder=5)
+
+        # Landing target — shown once confirmed, persists until mission ends
+        if landing_target is not None:
+            lx, ly = landing_target
+            ax.plot(wx_to_col(lx), wy_to_row(ly),
+                    'D', color='#ff8800', markersize=9, zorder=7,
+                    label='Landing target')
+            ax.add_patch(plt.Circle(
+                (wx_to_col(lx), wy_to_row(ly)),
+                config.PAD_SIZE / 2 / config.OCCUPANCY_GRID_RES,
+                color='#ff8800', fill=False, linewidth=1.5, zorder=6))
+
+        # Takeoff-pad marker at EKF origin
+        ax.plot(wx_to_col(0.0), wy_to_row(0.0),
+                'y^', markersize=6, zorder=5, label='Takeoff pad')
 
         # Region dividers
         for region_x in [config.START_REGION_X - config.TAKEOFF_PAD_X,
@@ -140,7 +187,7 @@ class MissionGUI:
 
         # Legend patches
         patches = [
-            mpatches.Patch(color='white', label='Free'),
+            mpatches.Patch(color='white',   label='Free'),
             mpatches.Patch(color='#b3b3b3', label='Unknown'),
             mpatches.Patch(color='#1a1a1a', label='Occupied'),
             mpatches.Patch(color='#737373', label='Inflated'),
@@ -157,29 +204,71 @@ class MissionGUI:
         ax.set_facecolor('#1a1a1a')
         ax.tick_params(colors='white')
 
+        if config.TAKEOFF_PAD_X is None:
+            return
+
+        px, py = config.TAKEOFF_PAD_X, config.TAKEOFF_PAD_Y
+        drone_x, drone_y, _, _ = shared.pose
+
         edges = shared.height_map_edges
+        pairs = shared.pad_pairs
         candidates = shared.pad_candidates
 
+        # Edge events (EKF → arena coords)
         if edges:
-            ex = [e.x for e in edges if e.kind == 'entry']
-            ey = [e.y for e in edges if e.kind == 'entry']
-            ox = [e.x for e in edges if e.kind == 'exit']
-            oy = [e.y for e in edges if e.kind == 'exit']
+            ex = [e.x + px for e in edges if e.kind == 'entry']
+            ey = [e.y + py for e in edges if e.kind == 'entry']
+            ox = [e.x + px for e in edges if e.kind == 'exit']
+            oy = [e.y + py for e in edges if e.kind == 'exit']
             if ex:
                 ax.scatter(ex, ey, c='#ff4444', s=12, label='Entry', zorder=3)
             if ox:
                 ax.scatter(ox, oy, c='#4444ff', s=12, label='Exit', zorder=3)
 
-        for cand in candidates:
-            ax.plot(cand.cx, cand.cy, 'g*', markersize=16, zorder=5, label='Pad candidate')
-            circle = plt.Circle((cand.cx, cand.cy), config.PAD_SIZE / 2,
-                                 color='lime', fill=False, linewidth=1.2, zorder=4)
-            ax.add_patch(circle)
+        # Matched entry-exit pairs: line from entry → exit + midpoint dot
+        for i, (cx, cy, enx, eny, exx, exy) in enumerate(pairs):
+            lbl = f'Pair ({len(pairs)})' if i == 0 else ''
+            ax.plot([enx + px, exx + px], [eny + py, exy + py],
+                    color='#ffaa00', lw=1.2, zorder=4, label=lbl)
 
-        if edges or candidates:
-            ax.legend(loc='upper right', fontsize=7,
-                      facecolor='#333333', labelcolor='white', framealpha=0.8)
+        # Landing target (arena coords) — must be read before the candidate block
+        landing_target = shared.landing_target
 
+        # Pad candidates — hidden once landing target is confirmed
+        if landing_target is None:
+            for cand in candidates:
+                cx_a, cy_a = cand.cx + px, cand.cy + py
+                ax.plot(cx_a, cy_a, 'g*', markersize=16, zorder=5,
+                        label='Pad candidate')
+                ax.add_patch(plt.Circle((cx_a, cy_a), config.PAD_SIZE / 2,
+                                        color='lime', fill=False,
+                                        linewidth=1.2, zorder=4))
+        if landing_target is not None:
+            lx, ly = landing_target[0] + px, landing_target[1] + py
+            ax.plot(lx, ly, 'D', color='#ff8800', markersize=10, zorder=7,
+                    label='Landing target')
+            ax.add_patch(plt.Circle((lx, ly), config.PAD_SIZE / 2,
+                                    color='#ff8800', fill=False,
+                                    linewidth=1.5, zorder=6))
+
+        # Drone marker
+        ax.plot(drone_x + px, drone_y + py,
+                'co', markersize=7, zorder=5, label='Drone')
+
+        # Landing region only
+        land_x0 = config.START_REGION_X + config.MIDDLE_REGION_X
+        ax.set_xlim(land_x0 - 0.1, config.ARENA_X + 0.1)
+        ax.set_ylim(-0.1, config.ARENA_Y + 0.1)
+        x_ticks = [x for x in range(int(land_x0), int(config.ARENA_X) + 1)]
+        ax.set_xticks(x_ticks)
+        ax.set_xticklabels([str(x) for x in x_ticks], fontsize=7)
+        ax.set_yticks(range(int(config.ARENA_Y) + 1))
+        ax.set_yticklabels([str(y) for y in range(int(config.ARENA_Y) + 1)],
+                           fontsize=7)
         ax.set_xlabel('x (m)', color='white', fontsize=8)
         ax.set_ylabel('y (m)', color='white', fontsize=8)
-        ax.set_aspect('equal', adjustable='datalim')
+        ax.set_aspect('equal', adjustable='box')
+
+        if edges or candidates or landing_target is not None:
+            ax.legend(loc='upper right', fontsize=6,
+                      facecolor='#333333', labelcolor='white', framealpha=0.8)

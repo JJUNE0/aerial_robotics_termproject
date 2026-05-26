@@ -164,14 +164,16 @@ class PadCandidate:
 class HeightMap:
     """Detects landing pad from z-ranger edge events.
 
-    Strategy: pair entry/exit events on the same scan row, measure footprint
-    width. A ~30 cm wide object is the pad; narrow/wide objects are obstacles.
+    Strategy: pair entry/exit events on the same scan column (X proximity),
+    then group pairs spatially. A pad (30 cm) generates 2+ pairs with an
+    X-span >= PAD_MIN_CLUSTER_SPAN; a narrow bar (13 cm) generates at most 1.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._entries: List[Tuple[float, float]] = []   # (x, y)
         self._exits: List[Tuple[float, float]] = []
+        self._pairs: List[Tuple[float, float]] = []     # matched pair centres
         self._candidates: List[PadCandidate] = []
 
     def add_entry(self, x: float, y: float):
@@ -185,56 +187,75 @@ class HeightMap:
 
     def _recompute_candidates(self):
         with self._lock:
-            candidates = []
+            # Step 1: pair each exit with the nearest unpaired entry on the
+            # same scan column (close X, any Y — Y-sweep pattern)
+            # pairs: (cx, cy, entry_x, entry_y, exit_x, exit_y)
+            pairs = []
             used_entries = set()
 
-            for ex_i, (exx, exy) in enumerate(self._exits):
-                # Find the nearest unpaired entry on the same row
+            for exx, exy in self._exits:
                 best_j = None
-                best_d = config.SCAN_ROW_SPACING
+                best_d = config.PAIR_SAME_COL_TOL   # max X distance to count as same column
                 for en_j, (enx, eny) in enumerate(self._entries):
                     if en_j in used_entries:
                         continue
-                    if abs(eny - exy) < config.SCAN_ROW_SPACING * 0.6:
-                        d = abs(enx - exx)
-                        if d < best_d:
-                            best_d = d
-                            best_j = en_j
+                    d = abs(enx - exx)
+                    if d < best_d:
+                        best_d = d
+                        best_j = en_j
 
                 if best_j is None:
                     continue
 
-                used_entries.add(best_j)
                 enx, eny = self._entries[best_j]
-                width = abs(exx - enx)
+                # Reject if Y span is too small — not a full pad crossing
+                if abs(eny - exy) < config.PAIR_MIN_Y_SPAN:
+                    continue
 
-                if config.PAD_MIN_WIDTH <= width <= config.PAD_MAX_WIDTH:
-                    cx = (enx + exx) / 2.0
-                    cy = (eny + exy) / 2.0
-                    candidates.append(PadCandidate(cx, cy))
+                used_entries.add(best_j)
+                pairs.append(((enx + exx) / 2.0, (eny + exy) / 2.0,
+                               enx, eny, exx, exy))
 
-            # Merge candidates that are close together (multiple scan rows)
-            merged = []
+            self._pairs = list(pairs)
+
+            # Step 2: group pairs whose centres are within PAD_SIZE of each other
             used = set()
-            for i, a in enumerate(candidates):
+            groups: List[List[int]] = []
+            for i in range(len(pairs)):
                 if i in used:
                     continue
-                group_x = [a.cx]
-                group_y = [a.cy]
+                group = [i]
                 used.add(i)
-                for j, b in enumerate(candidates):
+                for j in range(i + 1, len(pairs)):
                     if j in used:
                         continue
-                    if math.hypot(a.cx - b.cx, a.cy - b.cy) < config.PAD_SIZE:
-                        group_x.append(b.cx)
-                        group_y.append(b.cy)
+                    if math.hypot(pairs[i][0] - pairs[j][0],
+                                  pairs[i][1] - pairs[j][1]) < config.PAD_SIZE:
+                        group.append(j)
                         used.add(j)
-                merged.append(PadCandidate(
-                    cx=sum(group_x) / len(group_x),
-                    cy=sum(group_y) / len(group_y),
-                ))
-            self._candidates = merged
+                groups.append(group)
+
+            # Step 3: any group with ≥1 pair becomes a candidate.
+            # A single pair (wider row spacing) is sufficient to estimate pad centre.
+            candidates = []
+            for group in groups:
+                cx = sum(pairs[i][0] for i in group) / len(group)
+                cy = sum(pairs[i][1] for i in group) / len(group)
+                candidates.append(PadCandidate(cx=cx, cy=cy))
+
+            self._candidates = candidates
+
+    def get_pairs(self) -> List[Tuple[float, float]]:
+        with self._lock:
+            return list(self._pairs)
 
     def get_candidates(self) -> List[PadCandidate]:
         with self._lock:
             return list(self._candidates)
+
+    def reset(self):
+        with self._lock:
+            self._entries.clear()
+            self._exits.clear()
+            self._pairs.clear()
+            self._candidates.clear()

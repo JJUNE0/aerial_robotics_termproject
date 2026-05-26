@@ -36,15 +36,23 @@ class EdgeEvent:
 
 
 class EdgeDetector:
-    """Detects entry/exit edges in the z-ranger signal via EMA baseline."""
+    """Baseline-drop detector for the down-facing z-ranger.
+
+    Maintains an EMA baseline of z_down (frozen while over a surface).
+    Entry fires when the drop exceeds EDGE_THRESHOLD (5 cm).
+    Exit fires after EDGE_EXIT_DEBOUNCE consecutive samples where the
+    drop has returned below half the threshold.
+    """
 
     def __init__(self):
         self._baseline: Optional[float] = None
         self._in_drop: bool = False
+        self._exit_count: int = 0
 
     def reset(self):
         self._baseline = None
         self._in_drop = False
+        self._exit_count = 0
 
     def update(self, z_down: float, drone_x: float, drone_y: float) -> Optional[EdgeEvent]:
         if z_down is None:
@@ -54,18 +62,27 @@ class EdgeDetector:
             self._baseline = z_down
             return None
 
-        self._baseline = (config.EDGE_BASELINE_ALPHA * z_down +
-                          (1.0 - config.EDGE_BASELINE_ALPHA) * self._baseline)
-
         drop = self._baseline - z_down
         event = None
 
-        if not self._in_drop and drop > config.EDGE_THRESHOLD:
-            self._in_drop = True
-            event = EdgeEvent('entry', drone_x, drone_y, time.time())
-        elif self._in_drop and drop < config.EDGE_THRESHOLD * 0.4:
-            self._in_drop = False
-            event = EdgeEvent('exit', drone_x, drone_y, time.time())
+        if not self._in_drop:
+            if drop > config.EDGE_THRESHOLD:
+                self._in_drop = True
+                self._exit_count = 0
+                event = EdgeEvent('entry', drone_x, drone_y, time.time())
+        else:
+            if drop < config.EDGE_THRESHOLD * 0.5:
+                self._exit_count += 1
+                if self._exit_count >= config.EDGE_EXIT_DEBOUNCE:
+                    self._in_drop = False
+                    self._exit_count = 0
+                    event = EdgeEvent('exit', drone_x, drone_y, time.time())
+            else:
+                self._exit_count = 0
+
+        if not self._in_drop:
+            self._baseline = (config.EDGE_BASELINE_ALPHA * z_down +
+                              (1.0 - config.EDGE_BASELINE_ALPHA) * self._baseline)
 
         return event
 
@@ -73,8 +90,9 @@ class EdgeDetector:
 class SensorHub:
     """Manages all cflib log streams and produces SensorData + EdgeEvents."""
 
-    def __init__(self, cf):
+    def __init__(self, cf, logger=None):
         self._cf = cf
+        self._logger = logger
         self._lock = threading.Lock()
 
         self._pose = (0.0, 0.0, 0.0, 0.0)
@@ -92,7 +110,7 @@ class SensorHub:
     # ---------------------------------------------------------------- builders
 
     def _build_range_config(self) -> LogConfig:
-        cfg = LogConfig('ranges', period_in_ms=100)
+        cfg = LogConfig('ranges', period_in_ms=50)
         cfg.add_variable('range.front', 'uint16_t')
         cfg.add_variable('range.back', 'uint16_t')
         cfg.add_variable('range.left', 'uint16_t')
@@ -139,6 +157,9 @@ class SensorHub:
             self._timestamp = time.time()
             pose = self._pose
 
+        if self._logger is not None:
+            self._logger.log(pose[0], pose[1], r.down)
+
         event = self._edge_detector.update(r.down, pose[0], pose[1])
         if event is not None:
             self.edge_queue.put(event)
@@ -160,6 +181,15 @@ class SensorHub:
             self._battery_pct = pct
 
     # --------------------------------------------------------- lifecycle
+
+    def reset_edge_detector(self):
+        self._edge_detector.reset()
+        # Drain any stale events accumulated before the scan
+        while not self.edge_queue.empty():
+            try:
+                self.edge_queue.get_nowait()
+            except Exception:
+                break
 
     def start(self):
         self._cf.log.add_config(self._range_cfg)

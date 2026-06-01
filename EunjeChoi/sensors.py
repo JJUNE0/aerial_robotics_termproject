@@ -22,6 +22,7 @@ class RangeData:
 @dataclass
 class SensorData:
     pose: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0, 0.0))
+    velocity: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))   # vx, vy, vz (m/s)
     ranges: RangeData = field(default_factory=RangeData)
     battery_pct: float = 0.0
     timestamp: float = 0.0
@@ -36,53 +37,53 @@ class EdgeEvent:
 
 
 class EdgeDetector:
-    """Baseline-drop detector for the down-facing z-ranger.
+    """Direct peak/valley detector using a fixed cruise-altitude baseline.
 
-    Maintains an EMA baseline of z_down (frozen while over a surface).
-    Entry fires when the drop exceeds EDGE_THRESHOLD (5 cm).
-    Exit fires after EDGE_EXIT_DEBOUNCE consecutive samples where the
-    drop has returned below half the threshold.
+    ENTRY fires at the valley when z_down dips ≥ EDGE_ENTRY_DIP below baseline.
+    EXIT  fires at the peak  when z_down rises ≥ EDGE_EXIT_RISE above baseline.
     """
 
     def __init__(self):
-        self._baseline: Optional[float] = None
-        self._in_drop: bool = False
-        self._exit_count: int = 0
+        self._prev_z: Optional[float] = None
+        self._prev_x: float = 0.0
+        self._prev_y: float = 0.0
+        self._last_dir: int = 0   # +1 rising / -1 falling
 
     def reset(self):
-        self._baseline = None
-        self._in_drop = False
-        self._exit_count = 0
+        self._prev_z = None
+        self._last_dir = 0
 
     def update(self, z_down: float, drone_x: float, drone_y: float) -> Optional[EdgeEvent]:
         if z_down is None:
             return None
 
-        if self._baseline is None:
-            self._baseline = z_down
+        if self._prev_z is None:
+            self._prev_z = z_down
+            self._prev_x = drone_x
+            self._prev_y = drone_y
             return None
 
-        drop = self._baseline - z_down
+        dz = z_down - self._prev_z
         event = None
 
-        if not self._in_drop:
-            if drop > config.EDGE_THRESHOLD:
-                self._in_drop = True
-                self._exit_count = 0
-                event = EdgeEvent('entry', drone_x, drone_y, time.time())
-        else:
-            if drop < config.EDGE_THRESHOLD * 0.5:
-                self._exit_count += 1
-                if self._exit_count >= config.EDGE_EXIT_DEBOUNCE:
-                    self._in_drop = False
-                    self._exit_count = 0
-                    event = EdgeEvent('exit', drone_x, drone_y, time.time())
-            else:
-                self._exit_count = 0
+        if abs(dz) > config.EDGE_MIN_DZ:
+            cur_dir = 1 if dz > 0 else -1
 
-        if not self._in_drop:
-            self._baseline = (config.EDGE_BASELINE_ALPHA * z_down +
-                              (1.0 - config.EDGE_BASELINE_ALPHA) * self._baseline)
+            if self._last_dir < 0 and cur_dir > 0:
+                # VALLEY at previous sample — fire ENTRY if deep enough
+                if self._prev_z <= config.EDGE_BASELINE - config.EDGE_ENTRY_DIP:
+                    event = EdgeEvent('entry', self._prev_x, self._prev_y, time.time())
+
+            elif self._last_dir > 0 and cur_dir < 0:
+                # PEAK at previous sample — fire EXIT if high enough
+                if self._prev_z >= config.EDGE_BASELINE + config.EDGE_EXIT_RISE:
+                    event = EdgeEvent('exit', self._prev_x, self._prev_y, time.time())
+
+            self._last_dir = cur_dir
+
+        self._prev_z = z_down
+        self._prev_x = drone_x
+        self._prev_y = drone_y
 
         return event
 
@@ -95,7 +96,10 @@ class SensorHub:
         self._logger = logger
         self._lock = threading.Lock()
 
-        self._pose = (0.0, 0.0, 0.0, 0.0)
+        self._pose = (0.0, 0.0, 0.0, 0.0)   # x, y, z, yaw_deg
+        self._attitude = (0.0, 0.0)           # roll_deg, pitch_deg
+        self._yaw_ref = 0.0                   # ctrltarget.yaw (deg)
+        self._velocity = (0.0, 0.0, 0.0)
         self._ranges = RangeData()
         self._battery_pct = 0.0
         self._timestamp = 0.0
@@ -105,6 +109,8 @@ class SensorHub:
 
         self._range_cfg = self._build_range_config()
         self._pose_cfg = self._build_pose_config()
+        self._velocity_cfg = self._build_velocity_config()
+        self._setpoint_cfg = self._build_setpoint_config()
         self._battery_cfg = self._build_battery_config()
 
     # ---------------------------------------------------------------- builders
@@ -126,7 +132,23 @@ class SensorHub:
         cfg.add_variable('stateEstimate.y', 'float')
         cfg.add_variable('stateEstimate.z', 'float')
         cfg.add_variable('stateEstimate.yaw', 'float')
+        cfg.add_variable('stabilizer.roll', 'float')
+        cfg.add_variable('stabilizer.pitch', 'float')
         cfg.data_received_cb.add_callback(self._on_pose)
+        return cfg
+
+    def _build_velocity_config(self) -> LogConfig:
+        cfg = LogConfig('velocity', period_in_ms=50)
+        cfg.add_variable('stateEstimate.vx', 'float')
+        cfg.add_variable('stateEstimate.vy', 'float')
+        cfg.add_variable('stateEstimate.vz', 'float')
+        cfg.data_received_cb.add_callback(self._on_velocity)
+        return cfg
+
+    def _build_setpoint_config(self) -> LogConfig:
+        cfg = LogConfig('setpoint', period_in_ms=50)
+        cfg.add_variable('ctrltarget.yaw', 'float')
+        cfg.data_received_cb.add_callback(self._on_setpoint)
         return cfg
 
     def _build_battery_config(self) -> LogConfig:
@@ -158,7 +180,16 @@ class SensorHub:
             pose = self._pose
 
         if self._logger is not None:
-            self._logger.log(pose[0], pose[1], r.down)
+            with self._lock:
+                vel = self._velocity
+                att = self._attitude
+                yaw_ref = self._yaw_ref
+            self._logger.log(
+                pose[0], pose[1], r.down,
+                pose[3], att[0], att[1], yaw_ref,
+                vel[0], vel[1], vel[2],
+                r.front, r.back, r.left, r.right, r.up,
+            )
 
         event = self._edge_detector.update(r.down, pose[0], pose[1])
         if event is not None:
@@ -171,6 +202,22 @@ class SensorHub:
                 data['stateEstimate.y'],
                 data['stateEstimate.z'],
                 data['stateEstimate.yaw'],
+            )
+            self._attitude = (
+                data['stabilizer.roll'],
+                data['stabilizer.pitch'],
+            )
+
+    def _on_setpoint(self, timestamp, data, logconf):
+        with self._lock:
+            self._yaw_ref = data['ctrltarget.yaw']
+
+    def _on_velocity(self, timestamp, data, logconf):
+        with self._lock:
+            self._velocity = (
+                data['stateEstimate.vx'],
+                data['stateEstimate.vy'],
+                data['stateEstimate.vz'],
             )
 
     def _on_battery(self, timestamp, data, logconf):
@@ -194,24 +241,23 @@ class SensorHub:
     def start(self):
         self._cf.log.add_config(self._range_cfg)
         self._cf.log.add_config(self._pose_cfg)
+        self._cf.log.add_config(self._velocity_cfg)
+        self._cf.log.add_config(self._setpoint_cfg)
         self._cf.log.add_config(self._battery_cfg)
         self._range_cfg.start()
         self._pose_cfg.start()
+        self._velocity_cfg.start()
+        self._setpoint_cfg.start()
         self._battery_cfg.start()
 
     def stop(self):
-        try:
-            self._range_cfg.delete()
-        except Exception:
-            pass
-        try:
-            self._pose_cfg.delete()
-        except Exception:
-            pass
-        try:
-            self._battery_cfg.delete()
-        except Exception:
-            pass
+        for cfg in (self._range_cfg, self._pose_cfg,
+                    self._velocity_cfg, self._setpoint_cfg,
+                    self._battery_cfg):
+            try:
+                cfg.delete()
+            except Exception:
+                pass
 
     # ----------------------------------------------------------- read
 
@@ -220,6 +266,7 @@ class SensorHub:
             r = self._ranges
             return SensorData(
                 pose=self._pose,
+                velocity=self._velocity,
                 ranges=RangeData(
                     front=r.front, back=r.back,
                     left=r.left,  right=r.right,

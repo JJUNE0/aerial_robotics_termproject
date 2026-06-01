@@ -13,6 +13,7 @@ class SharedState:
         self._height_map_edges = []           # list of EdgeEvent
         self._pad_pairs = []                  # list of (cx, cy) matched pairs
         self._pad_candidates = []             # list of PadCandidate
+        self._home_pos = (0.0, 0.0)           # EKF position recorded after takeoff stabilisation
         self._target_pos = None               # current nav target (x, y) or None
         self._landing_target = None           # confirmed landing pad position (x, y) or None
         self._start_time = None
@@ -99,6 +100,18 @@ class SharedState:
     def add_height_map_edge(self, edge):
         with self._lock:
             self._height_map_edges.append(edge)
+
+    # ------------------------------------------------------- home position
+
+    @property
+    def home_pos(self):
+        with self._lock:
+            return self._home_pos
+
+    @home_pos.setter
+    def home_pos(self, v):
+        with self._lock:
+            self._home_pos = v
 
     # ------------------------------------------------------- nav target
 

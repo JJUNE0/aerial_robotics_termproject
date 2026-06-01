@@ -96,7 +96,12 @@ def do_takeoff(cf, shared, hub, occ, hmap):
     controller.init_ekf(cf)
     cf.high_level_commander.takeoff(config.FLIGHT_Z, 2.0)
     time.sleep(2.5)
-    _step(shared, hub, occ, hmap)
+    data = _step(shared, hub, occ, hmap)
+
+    # Record stabilised hover position as home — EKF may have drifted during takeoff
+    home_x, home_y = data.pose[0], data.pose[1]
+    shared.home_pos = (home_x, home_y)
+    print(f'[mission] home recorded: ({home_x:.3f}, {home_y:.3f})')
 
 
 def do_rotation_scan(cf, shared, hub, occ, hmap,
@@ -318,7 +323,8 @@ def do_nav_to_start(cf, shared, hub, occ, hmap):
     data = _step(shared, hub, occ, hmap)
     cx, cy, cz, _ = data.pose
 
-    gr, gc = occ.world_to_cell(0.0, 0.0)   # EKF origin = takeoff pad
+    hx, hy = shared.home_pos
+    gr, gc = occ.world_to_cell(hx, hy)
 
     def _plan(ox, oy):
         g = occ.snapshot()
@@ -327,7 +333,7 @@ def do_nav_to_start(cf, shared, hub, occ, hmap):
         if p is not None and len(p) > 1:
             p = simplify_path(p, g)
             return [occ.cell_to_world(r, c) for r, c in p[1:]]
-        return [(0.0, 0.0)]
+        return [(hx, hy)]
 
     waypoints = _plan(cx, cy)
     max_replans = 3
@@ -359,8 +365,9 @@ def do_nav_to_start(cf, shared, hub, occ, hmap):
 
 def do_land_on_start(cf, shared, hub, occ, hmap):
     shared.current_state = 'LANDING_ON_START'
+    hx, hy = shared.home_pos
     _navigate_to(cf, shared, hub, occ, hmap,
-                 0.0, 0.0, config.FLIGHT_Z, config.SCAN_SPEED)
+                 hx, hy, config.FLIGHT_Z, config.SCAN_SPEED)
     cf.high_level_commander.land(0.0, 2.0)
     time.sleep(2.8)
     shared.current_state = 'DONE'

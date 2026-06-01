@@ -8,6 +8,7 @@ import sys
 import os
 import glob
 
+import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.ticker
@@ -40,51 +41,54 @@ def pick_file() -> str:
 def load(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df['z_down_m'] = pd.to_numeric(df['z_down_m'], errors='coerce')
+    for col in ('yaw_deg', 'roll_deg', 'pitch_deg', 'yaw_ref_deg',
+                'vx_ms', 'vy_ms', 'vz_ms',
+                'range_front_m', 'range_back_m',
+                'range_left_m', 'range_right_m', 'range_up_m'):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+        else:
+            df[col] = 0.0
     return df.dropna(subset=['z_down_m'])
 
 
 # ------------------------------------------------------------------ edge detection
 
 def detect_edges(df: pd.DataFrame,
-                 threshold: float = config.EDGE_THRESHOLD,
-                 baseline_alpha: float = config.EDGE_BASELINE_ALPHA,
-                 exit_debounce: int = config.EDGE_EXIT_DEBOUNCE):
-    """Return (entries, exits) each as list of (time, x, y).
-
-    Mirrors the baseline-drop algorithm in EdgeDetector (sensors.py).
-    """
+                 baseline: float = config.EDGE_BASELINE,
+                 entry_dip: float = config.EDGE_ENTRY_DIP,
+                 exit_rise: float = config.EDGE_EXIT_RISE,
+                 min_dz: float = config.EDGE_MIN_DZ):
+    """Return (entries, exits) each as list of (time, x, y)."""
     entries, exits = [], []
-    baseline = None
-    in_drop = False
-    exit_count = 0
+
+    prev_z = prev_x = prev_y = prev_t = None
+    last_dir = 0
 
     for _, row in df.iterrows():
         z = row['z_down_m']
         t, x, y = row['time_s'], row['x_m'], row['y_m']
 
-        if baseline is None:
-            baseline = z
+        if prev_z is None:
+            prev_z, prev_x, prev_y, prev_t = z, x, y, t
             continue
 
-        drop = baseline - z
+        dz = z - prev_z
 
-        if not in_drop:
-            if drop > threshold:
-                in_drop = True
-                exit_count = 0
-                entries.append((t, x, y))
-        else:
-            if drop < threshold * 0.5:
-                exit_count += 1
-                if exit_count >= exit_debounce:
-                    in_drop = False
-                    exit_count = 0
-                    exits.append((t, x, y))
-            else:
-                exit_count = 0
+        if abs(dz) > min_dz:
+            cur_dir = 1 if dz > 0 else -1
 
-        if not in_drop:
-            baseline = baseline_alpha * z + (1 - baseline_alpha) * baseline
+            if last_dir < 0 and cur_dir > 0:
+                if prev_z <= baseline - entry_dip:
+                    entries.append((prev_t, prev_x, prev_y))
+
+            elif last_dir > 0 and cur_dir < 0:
+                if prev_z >= baseline + exit_rise:
+                    exits.append((prev_t, prev_x, prev_y))
+
+            last_dir = cur_dir
+
+        prev_z, prev_x, prev_y, prev_t = z, x, y, t
 
     return entries, exits
 
@@ -130,9 +134,17 @@ def plot(df: pd.DataFrame, title: str):
                for te, ex, ey in exits]
     pairs = compute_pairs(entries, exits)
 
+    # ---- cumulative integral of vz: ∫ vz dt  (z displacement from EKF velocity)
+    vz = df['vz_ms'].values
+    dt = np.diff(t, prepend=t[0])
+    integral = np.cumsum(vz * dt)
+
     # ---- figure layout: white background throughout
     plt.style.use('default')
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig = plt.figure(figsize=(13, 9))
+    ax1 = fig.add_subplot(2, 2, 1)
+    ax2 = fig.add_subplot(2, 2, 2)
+    ax3 = fig.add_subplot(2, 1, 2)
     fig.patch.set_facecolor('white')
     fig.suptitle(title, color='black', fontsize=11)
 
@@ -142,13 +154,19 @@ def plot(df: pd.DataFrame, title: str):
         sp.set_edgecolor('#aaa')
     ax1.tick_params(axis='both', which='both', colors='black', labelcolor='black')
 
-    ax1.plot(t, z, color='#1a6faf', lw=1.2, zorder=2)
+    ax1.plot(t, z, color='#1a6faf', lw=1.2, zorder=2, label='z_down')
+
+    # baseline
+    ax1.axhline(config.EDGE_BASELINE, color='#888888', lw=1.0, linestyle='--',
+                alpha=0.7, label=f'baseline ({config.EDGE_BASELINE:.2f} m)')
+
     for te, *_ in entries:
-        ax1.axvline(te, color='#cc2222', lw=1.0, linestyle='--', alpha=0.9,
+        ax1.axvline(te, color='#cc2222', lw=1.2, linestyle='--', alpha=0.9,
                     label='entry' if te == entries[0][0] else '')
     for te, *_ in exits:
-        ax1.axvline(te, color='#2244cc', lw=1.0, linestyle=':', alpha=0.9,
+        ax1.axvline(te, color='#2244cc', lw=1.2, linestyle=':', alpha=0.9,
                     label='exit' if te == exits[0][0] else '')
+
     ax1.set_xlabel('time (s)', color='black')
     ax1.set_ylabel('z_down (m)', color='black')
     ax1.set_title('z-ranger (down) vs Time', color='black')
@@ -156,8 +174,7 @@ def plot(df: pd.DataFrame, title: str):
     ax1.yaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())
     ax1.grid(True, which='major', color='#cccccc', linewidth=0.7, zorder=0)
     ax1.grid(True, which='minor', color='#eeeeee', linewidth=0.4, zorder=0)
-    if entries or exits:
-        ax1.legend(fontsize=8, facecolor='white', labelcolor='black', framealpha=0.9)
+    ax1.legend(fontsize=8, facecolor='white', labelcolor='black', framealpha=0.9)
 
     # ---- right: XY scatter
     ax2.set_facecolor('white')
@@ -204,6 +221,29 @@ def plot(df: pd.DataFrame, title: str):
     ax2.grid(True, which='minor', color='#eeeeee', linewidth=0.4, zorder=0)
     ax2.legend(fontsize=8, facecolor='white', labelcolor='black',
                framealpha=0.9, edgecolor='#aaa')
+
+    # ---- bottom: cumulative integral of dip
+    ax3.set_facecolor('white')
+    for sp in ax3.spines.values():
+        sp.set_edgecolor('#aaa')
+    ax3.tick_params(axis='both', which='both', colors='black', labelcolor='black')
+
+    ax3.plot(t, integral, color='#2a9d2a', lw=1.2, zorder=2, label='∫ vz dt')
+    ax3.axhline(0, color='#888888', lw=0.8, linestyle='--', alpha=0.6)
+    for te, *_ in entries:
+        ax3.axvline(te, color='#cc2222', lw=1.2, linestyle='--', alpha=0.9,
+                    label='entry' if te == entries[0][0] else '')
+    for te, *_ in exits:
+        ax3.axvline(te, color='#2244cc', lw=1.2, linestyle=':', alpha=0.9,
+                    label='exit' if te == exits[0][0] else '')
+    ax3.set_xlabel('time (s)', color='black')
+    ax3.set_ylabel('∫ vz dt  (m)', color='black')
+    ax3.set_title('Cumulative Z Displacement  (∫ vz dt)', color='black')
+    ax3.xaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())
+    ax3.yaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())
+    ax3.grid(True, which='major', color='#cccccc', linewidth=0.7, zorder=0)
+    ax3.grid(True, which='minor', color='#eeeeee', linewidth=0.4, zorder=0)
+    ax3.legend(fontsize=8, facecolor='white', labelcolor='black', framealpha=0.9)
 
     plt.tight_layout()
     plt.show()

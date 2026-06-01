@@ -108,16 +108,14 @@ def do_rotation_scan(cf, shared, hub, occ, hmap,
     """Rotate in place using yaw_rate velocity control while mapping."""
     shared.current_state = 'ROTATION_SCAN'
 
-    yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, angle_deg)  # deg/s
     duration = abs(angle_deg) / config.SCAN_ROTATE_RATE
-
+    yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, angle_deg)  # deg/s
     end_t = time.time() + duration
     while time.time() < end_t:
-        data = _step(shared, hub, occ, hmap)
+        _step(shared, hub, occ, hmap)
         cf.commander.send_hover_setpoint(0, 0, yaw_rate, config.FLIGHT_Z)
         time.sleep(config.DT)
 
-    # stop rotation
     cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
     _step(shared, hub, occ, hmap)
 
@@ -416,16 +414,15 @@ def run_mission(cf, shared: SharedState):
     except EmergencyException:
         shared.current_state = 'EMERGENCY_LAND'
         try:
-            cf.high_level_commander.land(0.0, 2.0)
+            controller.land_vel(cf, hub)
         except Exception:
             pass
-        time.sleep(3.0)
 
     except Exception as exc:
         shared.current_state = 'ERROR'
         print(f'[mission] unhandled exception: {exc}')
         try:
-            cf.high_level_commander.land(0.0, 3.0)
+            controller.land_vel(cf, hub)
         except Exception:
             pass
 

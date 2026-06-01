@@ -55,6 +55,9 @@ def _wait_for_ekf(cf, timeout: float = 10.0,
 
 def init_ekf(cf):
     """Reset EKF, wait for convergence, then arm. No HLC — velocity control only."""
+    print('[init_ekf] disabling HLC...')
+    cf.param.set_value('commander.enHighLevel', '0')
+
     print('[init_ekf] resetting EKF...')
     cf.param.set_value('kalman.resetEstimation', '1')
     time.sleep(0.1)

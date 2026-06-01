@@ -58,11 +58,8 @@ def _wait_for_ekf(cf, timeout: float = 10.0,
 
 
 def init_ekf(cf):
-    """Disarm leftover state, reset EKF, wait for convergence, then re-arm."""
-    print('[init_ekf] disarming...')
-    disarm(cf)
-    time.sleep(0.5)
-
+    """Reset EKF (re-establishes yaw=0), wait for convergence, then arm.
+    No prior disarm — avoids the state-transition instability seen with cfclient."""
     print('[init_ekf] resetting EKF...')
     cf.param.set_value('kalman.resetEstimation', '1')
     time.sleep(0.1)
@@ -74,7 +71,6 @@ def init_ekf(cf):
     cf.param.set_value('commander.enHighLevel', '1')
     time.sleep(0.1)
 
-    # Check if supervisor-based arming is supported (requires CRTP v12+)
     armed_ready = False
     for i in range(20):
         if cf.supervisor.can_be_armed:
@@ -89,8 +85,8 @@ def init_ekf(cf):
         print('[init_ekf] legacy firmware — sending arming request anyway')
 
     cf.supervisor.send_arming_request(True)
-    time.sleep(1.0)
-    print('[init_ekf] arm request sent')
+    time.sleep(0.5)
+    print('[init_ekf] armed')
 
 
 def go_to_nonblocking(cf, tx: float, ty: float, tz: float,

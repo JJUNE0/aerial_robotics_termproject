@@ -47,7 +47,7 @@ EDGE_BASELINE        = FLIGHT_Z   # fixed baseline = cruise altitude (m)
 EDGE_ENTRY_DIP       = 0.08       # valley must be ≥8 cm below baseline → entry
 EDGE_EXIT_RISE       = 0.06       # peak must be ≥6 cm above baseline  → exit
 EDGE_MIN_DZ          = 0.008      # minimum |dz| per sample to register a direction change (m)
-EDGE_COOLDOWN  = 0.5        # seconds to suppress detection after entry or exit fires
+EDGE_COOLDOWN  = 1.0        # seconds to suppress detection after entry or exit fires
 PAD_MIN_CLUSTER_SPAN = 0.15   # min X-span of paired cluster to be a pad (m)
 PAD_CONFIRM_TIME = 0.6        # hover-confirm duration (s)
 

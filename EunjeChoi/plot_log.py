@@ -57,12 +57,14 @@ def detect_edges(df: pd.DataFrame,
                  baseline: float = config.EDGE_BASELINE,
                  entry_dip: float = config.EDGE_ENTRY_DIP,
                  exit_rise: float = config.EDGE_EXIT_RISE,
-                 min_dz: float = config.EDGE_MIN_DZ):
+                 min_dz: float = config.EDGE_MIN_DZ,
+                 cooldown: float = config.EDGE_COOLDOWN):
     """Return (entries, exits) each as list of (time, x, y)."""
     entries, exits = [], []
 
     prev_z = prev_x = prev_y = prev_t = None
     last_dir = 0
+    cooldown_until = -1.0   # suppress detection until this time_s
 
     for _, row in df.iterrows():
         z = row['z_down_m']
@@ -77,13 +79,16 @@ def detect_edges(df: pd.DataFrame,
         if abs(dz) > min_dz:
             cur_dir = 1 if dz > 0 else -1
 
-            if last_dir < 0 and cur_dir > 0:
-                if prev_z <= baseline - entry_dip:
-                    entries.append((prev_t, prev_x, prev_y))
+            if t > cooldown_until:
+                if last_dir < 0 and cur_dir > 0:
+                    if prev_z <= baseline - entry_dip:
+                        entries.append((prev_t, prev_x, prev_y))
+                        cooldown_until = prev_t + cooldown
 
-            elif last_dir > 0 and cur_dir < 0:
-                if prev_z >= baseline + exit_rise:
-                    exits.append((prev_t, prev_x, prev_y))
+                elif last_dir > 0 and cur_dir < 0:
+                    if prev_z >= baseline + exit_rise:
+                        exits.append((prev_t, prev_x, prev_y))
+                        cooldown_until = prev_t + cooldown
 
             last_dir = cur_dir
 

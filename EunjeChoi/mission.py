@@ -94,8 +94,7 @@ def do_takeoff(cf, shared, hub, occ, hmap):
     shared.current_state = 'TAKEOFF'
     shared.start_timer()
     controller.init_ekf(cf)
-    cf.high_level_commander.takeoff(config.FLIGHT_Z, 2.0)
-    time.sleep(2.5)
+    controller.takeoff_vel(cf, config.FLIGHT_Z)
     data = _step(shared, hub, occ, hmap)
 
     # Record stabilised hover position as home — EKF may have drifted during takeoff
@@ -106,70 +105,59 @@ def do_takeoff(cf, shared, hub, occ, hmap):
 
 def do_rotation_scan(cf, shared, hub, occ, hmap,
                      angle_deg: float = config.SCAN_ROTATE_ANGLE):
-    """Rotate in place by angle_deg in one go_to command while mapping."""
+    """Rotate in place using yaw_rate velocity control while mapping."""
     shared.current_state = 'ROTATION_SCAN'
 
-    data = _step(shared, hub, occ, hmap)
-    cx, cy = data.pose[0], data.pose[1]
-    _, _, _, current_yaw_deg = data.pose
-
-    target_deg = (current_yaw_deg + angle_deg + 180.0) % 360.0 - 180.0
+    yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, angle_deg)  # deg/s
     duration = abs(angle_deg) / config.SCAN_ROTATE_RATE
-    cf.high_level_commander.go_to(cx, cy, config.FLIGHT_Z,
-                                  math.radians(target_deg), duration)
 
     end_t = time.time() + duration
     while time.time() < end_t:
-        _step(shared, hub, occ, hmap)
+        data = _step(shared, hub, occ, hmap)
+        cf.commander.send_hover_setpoint(0, 0, yaw_rate, config.FLIGHT_Z)
         time.sleep(config.DT)
 
+    # stop rotation
+    cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
     _step(shared, hub, occ, hmap)
 
 
 def _navigate_to(cf, shared, hub, occ, hmap,
                  tx: float, ty: float, tz: float,
                  speed: float) -> bool:
-    """Send go_to and monitor until arrival or obstacle. Returns True if arrived."""
+    """P-controller velocity navigation. Returns True if arrived, False if blocked."""
+    KP = 3.0
     shared.target_pos = (tx, ty)
-
-    data = _step(shared, hub, occ, hmap)
-    cx, cy, cz, cyaw = data.pose
-
     tz = min(tz, config.CEILING_LIMIT - 0.10)
-    duration = controller.go_to_nonblocking(cf, tx, ty, tz, cyaw, speed, cx, cy, cz)
-    elapsed = 0.0
 
-    while elapsed < duration:
+    settle_end = time.time() + config.NAV_SETTLE_TIMEOUT
+    while True:
         data = _step(shared, hub, occ, hmap)
-        cx, cy, cz, cyaw = data.pose
+        cx, cy, _, cyaw = data.pose
         dx, dy = tx - cx, ty - cy
+        dist = math.hypot(dx, dy)
+
+        if dist < config.NAV_ARRIVE_THRESHOLD:
+            cf.commander.send_hover_setpoint(0, 0, 0, tz)
+            shared.target_pos = None
+            return True
+
+        if time.time() > settle_end:
+            cf.commander.send_hover_setpoint(0, 0, 0, tz)
+            shared.target_pos = None
+            return dist < 0.15  # close enough counts as arrived
 
         if _obstacle_in_direction(data, dx, dy, cyaw):
-            # Hold current position — do NOT call hlc.stop() which terminates
-            # HLC control and causes the drone to fall on firmware without a
-            # low-level setpoint fallback.
-            cf.high_level_commander.go_to(cx, cy, cz, math.radians(cyaw), 0.5)
-            time.sleep(0.5)
+            cf.commander.send_hover_setpoint(0, 0, 0, tz)
+            time.sleep(0.3)
             shared.target_pos = None
             return False
 
-        if math.hypot(dx, dy) < 0.15:
-            break   # close — exit timing loop and wait for full settle below
-
+        v = min(speed, dist * KP)
+        vx_b, vy_b = controller.vel_to_body((dx / dist) * v,
+                                             (dy / dist) * v, cyaw)
+        cf.commander.send_hover_setpoint(vx_b, vy_b, 0, tz)
         time.sleep(config.DT)
-        elapsed += config.DT
-
-    # Wait until drone settles within arrival threshold (or timeout)
-    settle_end = time.time() + config.NAV_SETTLE_TIMEOUT
-    while time.time() < settle_end:
-        data = _step(shared, hub, occ, hmap)
-        cx, cy = data.pose[0], data.pose[1]
-        if math.hypot(tx - cx, ty - cy) < config.NAV_ARRIVE_THRESHOLD:
-            break
-        time.sleep(config.DT)
-
-    shared.target_pos = None
-    return True
 
 
 def do_nav_to_landing(cf, shared, hub, occ, hmap):
@@ -324,18 +312,14 @@ def do_pad_confirm(cf, shared, hub, occ, hmap) -> Optional[Tuple[float, float]]:
 
 def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     shared.current_state = 'LANDING_ON_PAD'
-    data = _step(shared, hub, occ, hmap)
-    cx, cy, cz, _ = data.pose
     _navigate_to(cf, shared, hub, occ, hmap,
                  pad_x, pad_y, config.FLIGHT_Z, config.SCAN_SPEED)
-    cf.high_level_commander.land(0.0, 2.0)
-    time.sleep(2.8)
+    controller.land_vel(cf, hub)
 
 
 def do_takeoff_from_pad(cf, shared, hub, occ, hmap):
     shared.current_state = 'TAKEOFF_FROM_PAD'
-    cf.high_level_commander.takeoff(config.FLIGHT_Z, 2.0)
-    time.sleep(2.5)
+    controller.takeoff_vel(cf, config.FLIGHT_Z)
     _step(shared, hub, occ, hmap)
 
 
@@ -394,8 +378,7 @@ def do_land_on_start(cf, shared, hub, occ, hmap):
     hx, hy = shared.home_pos
     _navigate_to(cf, shared, hub, occ, hmap,
                  hx, hy, config.FLIGHT_Z, config.SCAN_SPEED)
-    cf.high_level_commander.land(0.0, 2.0)
-    time.sleep(2.8)
+    controller.land_vel(cf, hub)
     shared.current_state = 'DONE'
 
 

@@ -8,13 +8,13 @@ import config
 
 
 def disarm(cf):
-    """Disarm motors and disable HLC — leaves firmware in a clean state."""
+    """Stop motors and disarm."""
     try:
-        cf.supervisor.send_arming_request(False)
+        cf.commander.send_stop_setpoint()
     except Exception:
         pass
     try:
-        cf.param.set_value('commander.enHighLevel', '0')
+        cf.supervisor.send_arming_request(False)
     except Exception:
         pass
 
@@ -22,11 +22,7 @@ def disarm(cf):
 def _wait_for_ekf(cf, timeout: float = 10.0,
                   var_threshold: float = 0.001,
                   history_len: int = 10):
-    """Block until kalman XY variances have stabilised.
-
-    Convergence criterion: the range (max-min) of the last `history_len`
-    variance samples is below `var_threshold` for both X and Y.
-    """
+    """Block until kalman XY variances have stabilised."""
     hist_x = [1000.0] * history_len
     hist_y = [1000.0] * history_len
     done = threading.Event()
@@ -58,8 +54,7 @@ def _wait_for_ekf(cf, timeout: float = 10.0,
 
 
 def init_ekf(cf):
-    """Reset EKF (re-establishes yaw=0), wait for convergence, then arm.
-    No prior disarm — avoids the state-transition instability seen with cfclient."""
+    """Reset EKF, wait for convergence, then arm. No HLC — velocity control only."""
     print('[init_ekf] resetting EKF...')
     cf.param.set_value('kalman.resetEstimation', '1')
     time.sleep(0.1)
@@ -67,9 +62,6 @@ def init_ekf(cf):
 
     print('[init_ekf] waiting for EKF to converge...')
     _wait_for_ekf(cf)
-
-    cf.param.set_value('commander.enHighLevel', '1')
-    time.sleep(0.1)
 
     armed_ready = False
     for i in range(20):
@@ -89,14 +81,42 @@ def init_ekf(cf):
     print('[init_ekf] armed')
 
 
-def go_to_nonblocking(cf, tx: float, ty: float, tz: float,
-                      yaw_deg: float, speed: float,
-                      current_x: float, current_y: float,
-                      current_z: float) -> float:
-    """Send HL go_to and return expected flight duration in seconds."""
-    dist = math.sqrt((tx - current_x) ** 2 +
-                     (ty - current_y) ** 2 +
-                     (tz - current_z) ** 2)
-    duration = max(dist / max(speed, 0.01), 0.3)
-    cf.high_level_commander.go_to(tx, ty, tz, math.radians(yaw_deg), duration)
-    return duration
+def hover(cf, z: float):
+    """Send a single hover-in-place setpoint."""
+    cf.commander.send_hover_setpoint(0, 0, 0, z)
+
+
+def takeoff_vel(cf, target_z: float, speed: float = 0.3, settle: float = 1.5):
+    """Ramp altitude from 0 to target_z using velocity control, then settle."""
+    print(f'[takeoff] ascending to {target_z:.2f} m')
+    z_cmd = 0.05
+    while z_cmd < target_z:
+        z_cmd = min(z_cmd + speed * config.DT, target_z)
+        cf.commander.send_hover_setpoint(0, 0, 0, z_cmd)
+        time.sleep(config.DT)
+
+    end_t = time.time() + settle
+    while time.time() < end_t:
+        cf.commander.send_hover_setpoint(0, 0, 0, target_z)
+        time.sleep(config.DT)
+    print('[takeoff] stable')
+
+
+def land_vel(cf, hub, speed: float = 0.2):
+    """Ramp altitude down to 0 using velocity control, then stop motors."""
+    print('[land] descending')
+    z_cmd = hub.read().pose[2]
+    while z_cmd > 0.05:
+        z_cmd = max(z_cmd - speed * config.DT, 0.0)
+        cf.commander.send_hover_setpoint(0, 0, 0, z_cmd)
+        time.sleep(config.DT)
+    cf.commander.send_stop_setpoint()
+    print('[land] landed')
+
+
+def vel_to_body(vx_w: float, vy_w: float, yaw_deg: float):
+    """Convert world-frame XY velocity to body frame."""
+    yaw_rad = math.radians(yaw_deg)
+    vx_b =  vx_w * math.cos(yaw_rad) + vy_w * math.sin(yaw_rad)
+    vy_b = -vx_w * math.sin(yaw_rad) + vy_w * math.cos(yaw_rad)
+    return vx_b, vy_b

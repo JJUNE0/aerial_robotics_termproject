@@ -47,17 +47,26 @@ class EdgeDetector:
         self._prev_z: Optional[float] = None
         self._prev_x: float = 0.0
         self._prev_y: float = 0.0
-        self._last_dir: int = 0   # +1 rising / -1 falling
+        self._last_dir: int = 0
+        self._cooldown_until: float = 0.0  # suppress detection until this wall-clock time
 
     def reset(self):
         self._prev_z = None
         self._last_dir = 0
+        self._cooldown_until = 0.0
 
     def update(self, z_down: float, drone_x: float, drone_y: float) -> Optional[EdgeEvent]:
         if z_down is None:
             return None
 
         if self._prev_z is None:
+            self._prev_z = z_down
+            self._prev_x = drone_x
+            self._prev_y = drone_y
+            return None
+
+        # During cooldown: keep tracking z but suppress events
+        if time.time() < self._cooldown_until:
             self._prev_z = z_down
             self._prev_x = drone_x
             self._prev_y = drone_y
@@ -70,14 +79,16 @@ class EdgeDetector:
             cur_dir = 1 if dz > 0 else -1
 
             if self._last_dir < 0 and cur_dir > 0:
-                # VALLEY at previous sample — fire ENTRY if deep enough
+                # VALLEY — fire ENTRY if deep enough, then start cooldown
                 if self._prev_z <= config.EDGE_BASELINE - config.EDGE_ENTRY_DIP:
                     event = EdgeEvent('entry', self._prev_x, self._prev_y, time.time())
+                    self._cooldown_until = time.time() + config.EDGE_COOLDOWN
 
             elif self._last_dir > 0 and cur_dir < 0:
-                # PEAK at previous sample — fire EXIT if high enough
+                # PEAK — fire EXIT if high enough, then start cooldown
                 if self._prev_z >= config.EDGE_BASELINE + config.EDGE_EXIT_RISE:
                     event = EdgeEvent('exit', self._prev_x, self._prev_y, time.time())
+                    self._cooldown_until = time.time() + config.EDGE_COOLDOWN
 
             self._last_dir = cur_dir
 

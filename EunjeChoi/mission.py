@@ -176,8 +176,9 @@ def do_nav_to_landing(cf, shared, hub, occ, hmap):
     shared.current_state = 'NAV_TO_LANDING'
     frontier = FrontierNavigator(occ)
     target_x = config.ekf_landing_region_start()
+    y_center = config.ARENA_Y / 2.0 - config.TAKEOFF_PAD_Y   # Y 중앙 (EKF 좌표)
 
-    failed_plans = 0    # consecutive planning failures — triggers rescan
+    failed_plans = 0    # consecutive planning failures
     MAX_FAILED = 3
 
     while True:
@@ -199,6 +200,11 @@ def do_nav_to_landing(cf, shared, hub, occ, hmap):
             if failed_plans >= MAX_FAILED:
                 do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
                 failed_plans = 0
+            elif abs(cy - y_center) > 0.10:
+                # +X 막힐 때마다 Y 중앙 방향으로 10cm씩 이동 후 즉시 재확인
+                step = 0.10 * (1 if y_center > cy else -1)
+                _navigate_to(cf, shared, hub, occ, hmap,
+                             cx, cy + step, config.FLIGHT_Z, config.NAV_SPEED)
             continue
 
         grid = occ.snapshot()
@@ -211,6 +217,10 @@ def do_nav_to_landing(cf, shared, hub, occ, hmap):
             if failed_plans >= MAX_FAILED:
                 do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
                 failed_plans = 0
+            elif abs(cy - y_center) > 0.10:
+                step = 0.10 * (1 if y_center > cy else -1)
+                _navigate_to(cf, shared, hub, occ, hmap,
+                             cx, cy + step, config.FLIGHT_Z, config.NAV_SPEED)
             continue
 
         failed_plans = 0
@@ -224,42 +234,58 @@ def do_nav_to_landing(cf, shared, hub, occ, hmap):
 
 
 def do_landing_region_scan(cf, shared, hub, occ, hmap):
+    """Column-based scan: go max +X first, then sweep Y columns back toward entry.
+    First Y direction chosen by current half (upper→down, lower→up).
+    """
     shared.current_state = 'LANDING_REGION_SCAN'
     hmap.reset()
     hub.reset_edge_detector()
 
-    x_start = config.ekf_landing_region_start()
-    x_end = config.ekf_arena_x_max() - 0.15
-    y_min = config.ekf_arena_y_min() + 0.25
-    y_max = config.ekf_arena_y_max() - 0.25
+    x_entry = config.ekf_landing_region_start() + config.DRONE_BODY_SIZE / 2
+    x_end   = config.ekf_arena_x_max() - 0.15
+    y_min   = config.ekf_arena_y_min() + 0.25
+    y_max   = config.ekf_arena_y_max() - 0.25
+    y_center = config.ARENA_Y / 2.0 - config.TAKEOFF_PAD_Y
 
-    waypoints = LawnmowerNavigator().generate(x_start, x_end, y_min, y_max)
+    def _scan_done():
+        return bool(hmap.get_candidates())
 
-    for wx, wy in waypoints:
-        if hmap.get_candidates():
-            break   # pad confirmed — skip remaining scan
+    def _go(tx, ty, speed=config.SCAN_SPEED):
+        _navigate_to(cf, shared, hub, occ, hmap, tx, ty, config.FLIGHT_Z, speed)
 
-        arrived = _navigate_to(cf, shared, hub, occ, hmap,
-                               wx, wy, config.FLIGHT_Z, config.SCAN_SPEED)
-        if arrived:
-            continue
+    # ── Step 1: go to max +X
+    data = _step(shared, hub, occ, hmap)
+    _go(x_end, data.pose[1], speed=config.NAV_SPEED)
+    if _scan_done():
+        return
 
-        # Blocked: map the obstacle with a rotation scan, then A* around it
-        do_rotation_scan(cf, shared, hub, occ, hmap)
+    # ── Step 2: decide first Y sweep direction based on current Y
+    data = _step(shared, hub, occ, hmap)
+    cx, cy = data.pose[0], data.pose[1]
+    if cy > y_center:          # upper half → sweep down first
+        y_first, y_second = y_min, y_max
+    else:                      # lower half → sweep up first
+        y_first, y_second = y_max, y_min
 
+    # ── Step 3: column lawnmower from x_end back to x_entry
+    x = cx
+    go_to_y = y_first
+
+    while x >= x_entry:
+        if _scan_done():
+            break
+
+        _go(x, go_to_y)
+        if _scan_done():
+            break
+
+        # alternate Y direction each column
+        go_to_y = y_second if go_to_y == y_first else y_first
+
+        # step back one column in -X
+        x -= config.SCAN_ROW_SPACING
         data = _step(shared, hub, occ, hmap)
-        cx, cy, _, _ = data.pose
-        grid = occ.snapshot()
-        path = astar(grid,
-                     occ.world_to_cell(cx, cy),
-                     occ.world_to_cell(wx, wy))
-        if path is not None and len(path) > 1:
-            path = simplify_path(path, grid)
-            for pr, pc in path[1:]:
-                pwx, pwy = occ.cell_to_world(pr, pc)
-                if not _navigate_to(cf, shared, hub, occ, hmap,
-                                    pwx, pwy, config.FLIGHT_Z, config.SCAN_SPEED):
-                    break   # still blocked — skip to next lawnmower waypoint
+        _go(x, data.pose[1], speed=config.NAV_SPEED)
 
 
 def do_pad_confirm(cf, shared, hub, occ, hmap) -> Optional[Tuple[float, float]]:

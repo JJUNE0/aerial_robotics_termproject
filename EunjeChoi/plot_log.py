@@ -8,7 +8,6 @@ import sys
 import os
 import glob
 
-import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.ticker
@@ -134,17 +133,9 @@ def plot(df: pd.DataFrame, title: str):
                for te, ex, ey in exits]
     pairs = compute_pairs(entries, exits)
 
-    # ---- cumulative integral of vz: ∫ vz dt  (z displacement from EKF velocity)
-    vz = df['vz_ms'].values
-    dt = np.diff(t, prepend=t[0])
-    integral = np.cumsum(vz * dt)
-
     # ---- figure layout: white background throughout
     plt.style.use('default')
-    fig = plt.figure(figsize=(13, 9))
-    ax1 = fig.add_subplot(2, 2, 1)
-    ax2 = fig.add_subplot(2, 2, 2)
-    ax3 = fig.add_subplot(2, 1, 2)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
     fig.patch.set_facecolor('white')
     fig.suptitle(title, color='black', fontsize=11)
 
@@ -221,29 +212,6 @@ def plot(df: pd.DataFrame, title: str):
     ax2.grid(True, which='minor', color='#eeeeee', linewidth=0.4, zorder=0)
     ax2.legend(fontsize=8, facecolor='white', labelcolor='black',
                framealpha=0.9, edgecolor='#aaa')
-
-    # ---- bottom: cumulative integral of dip
-    ax3.set_facecolor('white')
-    for sp in ax3.spines.values():
-        sp.set_edgecolor('#aaa')
-    ax3.tick_params(axis='both', which='both', colors='black', labelcolor='black')
-
-    ax3.plot(t, integral, color='#2a9d2a', lw=1.2, zorder=2, label='∫ vz dt')
-    ax3.axhline(0, color='#888888', lw=0.8, linestyle='--', alpha=0.6)
-    for te, *_ in entries:
-        ax3.axvline(te, color='#cc2222', lw=1.2, linestyle='--', alpha=0.9,
-                    label='entry' if te == entries[0][0] else '')
-    for te, *_ in exits:
-        ax3.axvline(te, color='#2244cc', lw=1.2, linestyle=':', alpha=0.9,
-                    label='exit' if te == exits[0][0] else '')
-    ax3.set_xlabel('time (s)', color='black')
-    ax3.set_ylabel('∫ vz dt  (m)', color='black')
-    ax3.set_title('Cumulative Z Displacement  (∫ vz dt)', color='black')
-    ax3.xaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())
-    ax3.yaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())
-    ax3.grid(True, which='major', color='#cccccc', linewidth=0.7, zorder=0)
-    ax3.grid(True, which='minor', color='#eeeeee', linewidth=0.4, zorder=0)
-    ax3.legend(fontsize=8, facecolor='white', labelcolor='black', framealpha=0.9)
 
     plt.tight_layout()
     plt.show()

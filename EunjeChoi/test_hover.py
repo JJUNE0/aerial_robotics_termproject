@@ -17,15 +17,14 @@ import controller
 from logger import FlightLogger
 from sensors import SensorHub
 
-FORWARD_DIST = 0.45 * 3   # m to travel in +X
+FORWARD_DIST = 0.45 * 2  # m to travel in +X
 SPEED        = 0.1   # m/s
 HOVER_TIME   = 1     # s pause at each end
-ENTRY_DECEL  = 1.0   # s to decelerate to a stop on entry
-ENTRY_HOVER  = 0.5   # s to hover after stopping
+PAUSE        = config.EDGE_COOLDOWN   # hover duration on entry/exit (= detection cooldown)
 
 
 def _travel(hlc, hub, tx, ty, speed, label='move'):
-    """go_to (tx, ty) at speed, pausing on every entry event."""
+    """go_to (tx, ty) at speed, pausing on every entry or exit event."""
     pose = hub.read().pose
     dist = ((tx - pose[0]) ** 2 + (ty - pose[1]) ** 2) ** 0.5
     duration = max(dist / speed, 0.5)
@@ -36,18 +35,16 @@ def _travel(hlc, hub, tx, ty, speed, label='move'):
     while time.time() < deadline:
         try:
             event = hub.edge_queue.get_nowait()
-            if event.kind == 'entry':
+            if event.kind in ('entry', 'exit'):
                 data = hub.read()
                 px, py = data.pose[0], data.pose[1]
                 vx, vy = data.velocity[0], data.velocity[1]
-                # Aim for the natural stopping point (v·t/2 under constant decel)
-                stop_x = px + vx * ENTRY_DECEL * 0.5
-                stop_y = py + vy * ENTRY_DECEL * 0.5
-                print(f'[test] entry at ({event.x:.3f}, {event.y:.3f}) '
-                      f'vel=({vx:.3f},{vy:.3f}) '
-                      f'→ stop ({stop_x:.3f}, {stop_y:.3f})')
-                hlc.go_to(stop_x, stop_y, config.FLIGHT_Z, 0.0, ENTRY_DECEL)
-                time.sleep(ENTRY_DECEL + ENTRY_HOVER)
+                stop_x = px + vx * PAUSE * 0.5
+                stop_y = py + vy * PAUSE * 0.5
+                print(f'[test] {event.kind} at ({event.x:.3f}, {event.y:.3f}) '
+                      f'vel=({vx:.3f},{vy:.3f}) → stop ({stop_x:.3f}, {stop_y:.3f})')
+                hlc.go_to(stop_x, stop_y, config.FLIGHT_Z, 0.0, PAUSE)
+                time.sleep(PAUSE)
                 remaining = max(deadline - time.time(), 0.5)
                 hlc.go_to(tx, ty, config.FLIGHT_Z, 0.0, remaining)
         except Exception:

@@ -10,8 +10,8 @@ LANDING_REGION_X = 1.5
 MIDDLE_REGION_X = ARENA_X - (START_REGION_X + LANDING_REGION_X) # 2 m
 
 # Takeoff pad location — provided: fill before running
-TAKEOFF_PAD_X = 0.5   # meters from arena west wall along +x
-TAKEOFF_PAD_Y = 1.5   # meters from arena south wall along +y
+TAKEOFF_PAD_X = 1.0   # meters from arena west wall along +x
+TAKEOFF_PAD_Y = 2.5   # meters from arena south wall along +y
 
 # Drone body spec (including protective frame)
 DRONE_BODY_SIZE = 0.15
@@ -28,14 +28,14 @@ NAV_ARRIVE_THRESHOLD = 0.03   # arrival radius — drone must settle within this
 NAV_SETTLE_TIMEOUT = 2.0      # max extra wait after motion for settling (s)
 
 # Rotation scan
-SCAN_ROTATE_RATE = 20.0    # deg/s
+SCAN_ROTATE_RATE = 15.0    # deg/s
 SCAN_ROTATE_STEP = 45.0    # deg per go_to command (smaller = less overshoot)
 SCAN_ROTATE_ANGLE = 90.0   # default total scan angle
 
 # Map resolution
 OCCUPANCY_GRID_RES = 0.03  # meters / cell
 HEIGHT_MAP_RES = 0.05
-INFLATION_RADIUS = DRONE_HALF_DIAGONAL + 0.03   # ~0.156 m
+INFLATION_RADIUS = DRONE_HALF_DIAGONAL + 0.03   #  m
 
 # Landing pad detection
 PAD_SIZE = 0.30               # 30 × 30 cm
@@ -43,10 +43,11 @@ PAD_HEIGHT = 0.10             # ~10 cm above floor
 SCAN_ROW_SPACING = 0.1        # column spacing for Y-sweep lawnmower (m)
 PAIR_SAME_COL_TOL = 0.06      # max |entry_x - exit_x| to count as same column (m)
 PAIR_MIN_Y_SPAN   = 0.20      # min |entry_y - exit_y| for a valid pad crossing (m)
-EDGE_BASELINE    = FLIGHT_Z   # fixed baseline = cruise altitude (m)
-EDGE_ENTRY_DIP   = 0.08       # valley must be ≥8 cm below baseline → entry
-EDGE_EXIT_RISE   = 0.06       # peak must be ≥6 cm above baseline  → exit
-EDGE_MIN_DZ      = 0.008      # minimum |dz| per sample to register a direction change (m)
+EDGE_BASELINE        = FLIGHT_Z   # fixed baseline = cruise altitude (m)
+EDGE_ENTRY_DIP       = 0.08       # valley must be ≥8 cm below baseline → entry
+EDGE_EXIT_RISE       = 0.06       # peak must be ≥6 cm above baseline  → exit
+EDGE_MIN_DZ          = 0.008      # minimum |dz| per sample to register a direction change (m)
+EDGE_COOLDOWN  = 0.5        # seconds to suppress detection after entry or exit fires
 PAD_MIN_CLUSTER_SPAN = 0.15   # min X-span of paired cluster to be a pad (m)
 PAD_CONFIRM_TIME = 0.6        # hover-confirm duration (s)
 

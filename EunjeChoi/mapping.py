@@ -171,57 +171,81 @@ class HeightMap:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._entries: List[Tuple[float, float]] = []   # (x, y)
+        self._entries: List[Tuple[float, float]] = []
         self._exits: List[Tuple[float, float]] = []
-        self._pairs: List[Tuple[float, float]] = []     # matched pair centres
+        self._pairs: List[Tuple[float, float]] = []
         self._candidates: List[PadCandidate] = []
+        self._entry_seq: int = 0
+        self._exit_seq: int = 0
+        self._last_entry_pos: Optional[Tuple[float, float]] = None
+        self._last_exit_pos: Optional[Tuple[float, float]] = None
+
+    @property
+    def entry_seq(self) -> int:
+        with self._lock:
+            return self._entry_seq
+
+    @property
+    def exit_seq(self) -> int:
+        with self._lock:
+            return self._exit_seq
+
+    @property
+    def last_entry_pos(self) -> Optional[Tuple[float, float]]:
+        with self._lock:
+            return self._last_entry_pos
+
+    @property
+    def last_exit_pos(self) -> Optional[Tuple[float, float]]:
+        with self._lock:
+            return self._last_exit_pos
 
     def add_entry(self, x: float, y: float):
         with self._lock:
             self._entries.append((x, y))
+            self._entry_seq += 1
+            self._last_entry_pos = (x, y)
 
     def add_exit(self, x: float, y: float):
         with self._lock:
             self._exits.append((x, y))
+            self._exit_seq += 1
+            self._last_exit_pos = (x, y)
         self._recompute_candidates()
 
     def _recompute_candidates(self):
         with self._lock:
-            # Step 1: pair each exit with the nearest unpaired entry on the
-            # same scan column (close X, any Y — Y-sweep pattern)
-            # pairs: (cx, cy, entry_x, entry_y, exit_x, exit_y)
+            # Pair each exit with the most recent unpaired entry (time-based).
+            # Valid pair: Euclidean distance ≥ PAIR_MIN_Y_SPAN (20 cm).
             pairs = []
             used_entries = set()
 
             for exx, exy in self._exits:
+                # Find most recent unpaired entry
                 best_j = None
-                best_d = config.PAIR_SAME_COL_TOL   # max X distance to count as same column
-                for en_j, (enx, eny) in enumerate(self._entries):
-                    if en_j in used_entries:
-                        continue
-                    d = abs(enx - exx)
-                    if d < best_d:
-                        best_d = d
-                        best_j = en_j
+                for j in range(len(self._entries) - 1, -1, -1):
+                    if j not in used_entries:
+                        best_j = j
+                        break
 
                 if best_j is None:
                     continue
 
                 enx, eny = self._entries[best_j]
-                # Reject if Y span is too small — not a full pad crossing
-                if abs(eny - exy) < config.PAIR_MIN_Y_SPAN:
-                    continue
+                if math.hypot(enx - exx, eny - exy) < config.PAIR_MIN_Y_SPAN:
+                    continue   # too close — not a valid pad crossing
 
                 used_entries.add(best_j)
-                pairs.append(((enx + exx) / 2.0, (eny + exy) / 2.0,
-                               enx, eny, exx, exy))
+                cx = (enx + exx) / 2.0
+                cy = (eny + exy) / 2.0
+                pairs.append((cx, cy, enx, eny, exx, exy))
 
             self._pairs = list(pairs)
 
-            # Step 2: group pairs whose centres are within PAD_SIZE of each other
+            # Merge pairs within PAD_SIZE of each other → one candidate per group
             used = set()
-            groups: List[List[int]] = []
-            for i in range(len(pairs)):
+            candidates = []
+            for i, (cx, cy, *_) in enumerate(pairs):
                 if i in used:
                     continue
                 group = [i]
@@ -229,19 +253,12 @@ class HeightMap:
                 for j in range(i + 1, len(pairs)):
                     if j in used:
                         continue
-                    if math.hypot(pairs[i][0] - pairs[j][0],
-                                  pairs[i][1] - pairs[j][1]) < config.PAD_SIZE:
+                    if math.hypot(pairs[j][0] - cx, pairs[j][1] - cy) < config.PAD_SIZE:
                         group.append(j)
                         used.add(j)
-                groups.append(group)
-
-            # Step 3: any group with ≥1 pair becomes a candidate.
-            # A single pair (wider row spacing) is sufficient to estimate pad centre.
-            candidates = []
-            for group in groups:
-                cx = sum(pairs[i][0] for i in group) / len(group)
-                cy = sum(pairs[i][1] for i in group) / len(group)
-                candidates.append(PadCandidate(cx=cx, cy=cy))
+                gcx = sum(pairs[k][0] for k in group) / len(group)
+                gcy = sum(pairs[k][1] for k in group) / len(group)
+                candidates.append(PadCandidate(cx=gcx, cy=gcy))
 
             self._candidates = candidates
 
@@ -256,6 +273,13 @@ class HeightMap:
     def reset(self):
         with self._lock:
             self._entries.clear()
+            self._exits.clear()
+            self._pairs.clear()
+            self._candidates.clear()
+            self._entry_seq = 0
+            self._exit_seq = 0
+            self._last_entry_pos = None
+            self._last_exit_pos = None
             self._exits.clear()
             self._pairs.clear()
             self._candidates.clear()

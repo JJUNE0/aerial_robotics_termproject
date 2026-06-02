@@ -28,14 +28,14 @@ NAV_ARRIVE_THRESHOLD = 0.03   # arrival radius — drone must settle within this
 NAV_SETTLE_TIMEOUT = 2.0      # max extra wait after motion for settling (s)
 
 # Rotation scan
-SCAN_ROTATE_RATE = 15.0    # deg
+SCAN_ROTATE_RATE = 15.0    # deg/s
 SCAN_ROTATE_STEP = 45.0    # deg per go_to command (smaller = less overshoot)
 SCAN_ROTATE_ANGLE = 90.0   # default total scan angle
 
 # Map resolution
-OCCUPANCY_GRID_RES = 0.03  # meters / cell
+OCCUPANCY_GRID_RES = 0.02  # meters / cell
 HEIGHT_MAP_RES = 0.05
-INFLATION_RADIUS = DRONE_HALF_DIAGONAL  #  m
+INFLATION_RADIUS = DRONE_HALF_DIAGONAL -0.02  #  m
 
 # Landing pad detection
 PAD_SIZE = 0.30               # 30 × 30 cm
@@ -44,10 +44,15 @@ SCAN_ROW_SPACING = 0.1        # column spacing for Y-sweep lawnmower (m)
 PAIR_SAME_COL_TOL = 0.06      # max |entry_x - exit_x| to count as same column (m)
 PAIR_MIN_Y_SPAN   = 0.20      # min |entry_y - exit_y| for a valid pad crossing (m)
 EDGE_BASELINE        = FLIGHT_Z   # fixed baseline = cruise altitude (m)
-EDGE_ENTRY_DIP       = 0.08       # valley must be ≥8 cm below baseline → entry
-EDGE_EXIT_RISE       = 0.06       # peak must be ≥6 cm above baseline  → exit
+EDGE_ENTRY_DIP       = 0.05       # valley must be ≥5 cm below baseline → entry
+EDGE_EXIT_RISE       = 0.05       # peak must be ≥5 cm above baseline  → exit
 EDGE_MIN_DZ          = 0.008      # minimum |dz| per sample to register a direction change (m)
-EDGE_COOLDOWN  = 1.0        # seconds to suppress detection after entry or exit fires
+EDGE_COOLDOWN        = 1.0        # seconds to suppress detection after entry or exit fires
+
+# Precise pad scan
+PRECISE_SWEEP_DIST   = 0.30       # max sweep in each direction from entry point (m)
+PRECISE_EXIT_MARGIN  = 0.05       # extra distance beyond exit before reversing (m)
+
 PAD_MIN_CLUSTER_SPAN = 0.15   # min X-span of paired cluster to be a pad (m)
 PAD_CONFIRM_TIME = 0.6        # hover-confirm duration (s)
 

@@ -121,8 +121,8 @@ def do_rotation_scan(cf, shared, hub, occ, hmap,
     duration = abs(angle_deg) / config.SCAN_ROTATE_RATE
     yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, angle_deg)  # deg/s
 
-    hold_kp = 2.0
-    max_hold_speed = min(0.1, config.NAV_SPEED)
+    hold_kp = 1.5
+    max_hold_speed = min(0.08, config.NAV_SPEED)
 
     end_t = time.time() + duration
     while time.time() < end_t:
@@ -139,6 +139,86 @@ def do_rotation_scan(cf, shared, hub, occ, hmap,
 
     cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
     _step(shared, hub, occ, hmap)
+
+
+def _scan_navigate(cf, shared, hub, occ, hmap, tx, ty):
+    """Navigate at SCAN_SPEED and stop immediately when entry event fires.
+    Returns entry (x, y) if detected, None if arrived or blocked."""
+    KP = 3.0
+    prev_seq = hmap.entry_seq
+
+    while True:
+        data = _step(shared, hub, occ, hmap)
+        cx, cy, _, cyaw = data.pose
+
+        if hmap.entry_seq > prev_seq:
+            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+            time.sleep(0.3)
+            return hmap.last_entry_pos
+
+        dx, dy = tx - cx, ty - cy
+        dist = math.hypot(dx, dy)
+
+        if dist < config.NAV_ARRIVE_THRESHOLD:
+            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+            return None
+
+        if _obstacle_in_direction(data, dx, dy, cyaw):
+            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+            return None
+
+        v = min(config.SCAN_SPEED, dist * KP)
+        vx_b, vy_b = controller.vel_to_body((dx / dist) * v, (dy / dist) * v, cyaw)
+        cf.commander.send_hover_setpoint(vx_b, vy_b, 0, config.FLIGHT_Z)
+        time.sleep(config.DT)
+
+
+def do_precise_pad_scan(cf, shared, hub, occ, hmap, rough_x, rough_y):
+    """From rough entry position, sweep ±PRECISE_SWEEP_DIST in 4 directions.
+    Collects entry-exit pairs to confirm and refine pad position."""
+    shared.current_state = 'PAD_CONFIRM'
+    hmap.reset()
+    hub.reset_edge_detector()
+
+    for ddx, ddy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+        # Return to rough position
+        _navigate_to(cf, shared, hub, occ, hmap,
+                     rough_x, rough_y, config.FLIGHT_Z, config.SCAN_SPEED)
+        hub.reset_edge_detector()
+        time.sleep(config.EDGE_COOLDOWN)
+
+        # Record start as entry
+        hmap.add_entry(rough_x, rough_y)
+        prev_exit_seq = hmap.exit_seq
+
+        tx = rough_x + ddx * config.PRECISE_SWEEP_DIST
+        ty = rough_y + ddy * config.PRECISE_SWEEP_DIST
+        KP = 3.0
+
+        while True:
+            data = _step(shared, hub, occ, hmap)
+            cx, cy, _, cyaw = data.pose
+
+            if hmap.exit_seq > prev_exit_seq:
+                ep = hmap.last_exit_pos
+                mx = ep[0] + ddx * config.PRECISE_EXIT_MARGIN
+                my = ep[1] + ddy * config.PRECISE_EXIT_MARGIN
+                _navigate_to(cf, shared, hub, occ, hmap,
+                             mx, my, config.FLIGHT_Z, config.SCAN_SPEED)
+                time.sleep(config.EDGE_COOLDOWN)
+                break
+
+            ex, ey = tx - cx, ty - cy
+            dist = math.hypot(ex, ey)
+            if dist < 0.05:
+                break
+
+            v = min(config.SCAN_SPEED, dist * KP)
+            vx_b, vy_b = controller.vel_to_body((ex/dist)*v, (ey/dist)*v, cyaw)
+            cf.commander.send_hover_setpoint(vx_b, vy_b, 0, config.FLIGHT_Z)
+            time.sleep(config.DT)
+
+    return hmap.get_candidates()
 
 
 def _navigate_to(cf, shared, hub, occ, hmap,
@@ -186,7 +266,7 @@ def do_nav_to_landing(cf, shared, hub, occ, hmap):
     y_center = config.ARENA_Y / 2.0 - config.TAKEOFF_PAD_Y   # Y 중앙 (EKF 좌표)
 
     failed_plans = 0    # consecutive planning failures
-    MAX_FAILED = 3
+    MAX_FAILED = 5
 
     while True:
         data = _step(shared, hub, occ, hmap)
@@ -230,69 +310,87 @@ def do_nav_to_landing(cf, shared, hub, occ, hmap):
                              cx, cy + step, config.FLIGHT_Z, config.NAV_SPEED)
             continue
 
+        # A* confirmed a path exists — go directly to the target
         failed_plans = 0
-        path = simplify_path(path, grid)
-        for pr, pc in path[1:]:
-            pwx, pwy = occ.cell_to_world(pr, pc)
-            if not _navigate_to(cf, shared, hub, occ, hmap,
-                                pwx, pwy, config.FLIGHT_Z, config.NAV_SPEED):
+        if not _navigate_to(cf, shared, hub, occ, hmap,
+                            target[0], target[1], config.FLIGHT_Z, config.NAV_SPEED):
+            failed_plans += 1
+            if failed_plans >= MAX_FAILED:
                 do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
-                break   # re-plan from new position in next loop iteration
+                failed_plans = 0
 
 
 def do_landing_region_scan(cf, shared, hub, occ, hmap):
-    """Column-based scan: go max +X first, then sweep Y columns back toward entry.
-    First Y direction chosen by current half (upper→down, lower→up).
+    """Row-based X sweep lawnmower. Advances in Y, sweeps in X.
+    Obstacle avoidance A: if blocked mid-sweep, advance to next Y row.
     """
     shared.current_state = 'LANDING_REGION_SCAN'
     hmap.reset()
     hub.reset_edge_detector()
 
-    x_entry = config.ekf_landing_region_start() + config.DRONE_BODY_SIZE / 2
-    x_end   = config.ekf_arena_x_max() - 0.15
-    y_min   = config.ekf_arena_y_min() + 0.25
-    y_max   = config.ekf_arena_y_max() - 0.25
+    x_entry  = config.ekf_landing_region_start() + 0.10
+    x_end    = config.ekf_arena_x_max() - 0.10
+    y_min    = config.ekf_arena_y_min() + 0.10
+    y_max    = config.ekf_arena_y_max() - 0.10
     y_center = config.ARENA_Y / 2.0 - config.TAKEOFF_PAD_Y
 
-    def _scan_done():
-        return bool(hmap.get_candidates())
+    def _go(tx, ty, speed=config.NAV_SPEED):
+        return _navigate_to(cf, shared, hub, occ, hmap,
+                            tx, ty, config.FLIGHT_Z, speed)
 
-    def _go(tx, ty, speed=config.SCAN_SPEED):
-        _navigate_to(cf, shared, hub, occ, hmap, tx, ty, config.FLIGHT_Z, speed)
-
-    # ── Step 1: go to max +X
+    # Decide Y start and step direction based on current position
     data = _step(shared, hub, occ, hmap)
-    _go(x_end, data.pose[1], speed=config.NAV_SPEED)
-    if _scan_done():
-        return
+    cy = data.pose[1]
+    if cy > y_center:
+        y = max(y_min, min(y_max, cy))
+        y_step = -config.SCAN_ROW_SPACING
+    else:
+        y = max(y_min, min(y_max, cy))
+        y_step = config.SCAN_ROW_SPACING
 
-    # ── Step 2: decide first Y sweep direction based on current Y
-    data = _step(shared, hub, occ, hmap)
-    cx, cy = data.pose[0], data.pose[1]
-    if cy > y_center:          # upper half → sweep down first
-        y_first, y_second = y_min, y_max
-    else:                      # lower half → sweep up first
-        y_first, y_second = y_max, y_min
+    going_right = True
 
-    # ── Step 3: column lawnmower from x_end back to x_entry
-    x = cx
-    go_to_y = y_first
-
-    while x >= x_entry:
-        if _scan_done():
-            break
-
-        _go(x, go_to_y)
-        if _scan_done():
-            break
-
-        # alternate Y direction each column
-        go_to_y = y_second if go_to_y == y_first else y_first
-
-        # step back one column in -X
-        x -= config.SCAN_ROW_SPACING
+    while y_min <= y <= y_max:
+        # 1. Set Y position for this row
         data = _step(shared, hub, occ, hmap)
-        _go(x, data.pose[1], speed=config.NAV_SPEED)
+        _go(data.pose[0], y)
+        hub.reset_edge_detector()
+
+        # 2. X sweep — stop immediately on entry, then do precise scan
+        x_target = x_end if going_right else x_entry
+        while True:
+            entry_pos = _scan_navigate(cf, shared, hub, occ, hmap, x_target, y)
+
+            if entry_pos is not None:
+                # Entry detected → precise 4-direction scan
+                candidates = do_precise_pad_scan(
+                    cf, shared, hub, occ, hmap, entry_pos[0], entry_pos[1])
+                if candidates:
+                    shared.current_state = 'LANDING_REGION_SCAN'
+                    return  # pad confirmed
+
+                # Not confirmed — resume scan from current position
+                shared.current_state = 'LANDING_REGION_SCAN'
+                hmap.reset()
+                hub.reset_edge_detector()
+                data = _step(shared, hub, occ, hmap)
+                x_target = x_end if going_right else x_entry
+                continue
+
+            # Avoidance C: if blocked, advance Y and retry
+            data = _step(shared, hub, occ, hmap)
+            if math.hypot(x_target - data.pose[0], y - data.pose[1]) > 0.10:
+                y_try = y + y_step
+                if y_try < y_min or y_try > y_max:
+                    break
+                _go(data.pose[0], y_try)
+                y = y_try
+                continue
+            break
+
+        # 3. Advance Y and flip direction
+        y += y_step
+        going_right = not going_right
 
 
 def do_pad_confirm(cf, shared, hub, occ, hmap) -> Optional[Tuple[float, float]]:

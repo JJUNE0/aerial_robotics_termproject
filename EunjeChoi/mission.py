@@ -105,15 +105,29 @@ def do_takeoff(cf, shared, hub, occ, hmap):
 
 def do_rotation_scan(cf, shared, hub, occ, hmap,
                      angle_deg: float = config.SCAN_ROTATE_ANGLE):
-    """Rotate in place using yaw_rate velocity control while mapping."""
+    """Rotate with yaw-rate control while holding the scan start position."""
     shared.current_state = 'ROTATION_SCAN'
+
+    data = _step(shared, hub, occ, hmap)
+    hold_x, hold_y = data.pose[0], data.pose[1]
 
     duration = abs(angle_deg) / config.SCAN_ROTATE_RATE
     yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, angle_deg)  # deg/s
     end_t = time.time() + duration
+
+    hold_kp = 1.5
+    max_hold_speed = min(0.08, config.NAV_SPEED)
+
     while time.time() < end_t:
-        _step(shared, hub, occ, hmap)
-        cf.commander.send_hover_setpoint(0, 0, yaw_rate, config.FLIGHT_Z)
+        data = _step(shared, hub, occ, hmap)
+        cx, cy, _, cyaw = data.pose
+        ex, ey = hold_x - cx, hold_y - cy
+
+        vx_w = max(-max_hold_speed, min(max_hold_speed, ex * hold_kp))
+        vy_w = max(-max_hold_speed, min(max_hold_speed, ey * hold_kp))
+        vx_b, vy_b = controller.vel_to_body(vx_w, vy_w, cyaw)
+
+        cf.commander.send_hover_setpoint(vx_b, vy_b, yaw_rate, config.FLIGHT_Z)
         time.sleep(config.DT)
 
     cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)

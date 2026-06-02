@@ -121,8 +121,8 @@ def do_rotation_scan(cf, shared, hub, occ, hmap,
     duration = abs(angle_deg) / config.SCAN_ROTATE_RATE
     yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, angle_deg)  # deg/s
 
-    hold_kp = 1.5
-    max_hold_speed = min(0.08, config.NAV_SPEED)
+    hold_kp = 2.0
+    max_hold_speed = min(0.1, config.NAV_SPEED)
 
     end_t = time.time() + duration
     while time.time() < end_t:

@@ -28,7 +28,7 @@ NAV_ARRIVE_THRESHOLD = 0.03   # arrival radius — drone must settle within this
 NAV_SETTLE_TIMEOUT = 2.0      # max extra wait after motion for settling (s)
 
 # Rotation scan
-SCAN_ROTATE_RATE = 15.0    # deg/s
+SCAN_ROTATE_RATE = 15.0    # deg
 SCAN_ROTATE_STEP = 45.0    # deg per go_to command (smaller = less overshoot)
 SCAN_ROTATE_ANGLE = 90.0   # default total scan angle
 

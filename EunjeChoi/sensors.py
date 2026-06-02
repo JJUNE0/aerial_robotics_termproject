@@ -240,6 +240,18 @@ class SensorHub:
 
     # --------------------------------------------------------- lifecycle
 
+    def set_state(self, state: str):
+        if self._logger is not None:
+            self._logger.set_state(state)
+
+    def set_target(self, x, y):
+        if self._logger is not None:
+            self._logger.set_target(x, y)
+
+    def clear_target(self):
+        if self._logger is not None:
+            self._logger.clear_target()
+
     def reset_edge_detector(self):
         self._edge_detector.reset()
         # Drain any stale events accumulated before the scan

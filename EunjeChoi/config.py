@@ -20,7 +20,7 @@ DRONE_HALF_DIAGONAL = (DRONE_BODY_SIZE / 2) * math.sqrt(2)   # ~0.106 m
 # Flight
 FLIGHT_Z = 0.2           # cruise altitude (m)
 CEILING_LIMIT = 1.20     # hard ceiling (m)
-NAV_SPEED = 0.2          # navigation speed (m/s)
+NAV_SPEED = 0.3          # navigation speed (m/s)
 SCAN_SPEED = 0.1        # lawnmower speed (m/s)
 AVOID_THRESHOLD = 0.40        # begin avoidance (m)
 STOP_THRESHOLD = 0.25         # stop threshold (m)
@@ -35,7 +35,7 @@ SCAN_ROTATE_ANGLE = 90.0   # default total scan angle
 # Map resolution
 OCCUPANCY_GRID_RES = 0.03  # meters / cell
 HEIGHT_MAP_RES = 0.05
-INFLATION_RADIUS = DRONE_HALF_DIAGONAL + 0.03   #  m
+INFLATION_RADIUS = DRONE_HALF_DIAGONAL  #  m
 
 # Landing pad detection
 PAD_SIZE = 0.30               # 30 × 30 cm

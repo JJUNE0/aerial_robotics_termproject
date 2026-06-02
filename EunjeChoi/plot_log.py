@@ -5,10 +5,10 @@ Usage:
 """
 
 import sys
-
 import os
 import glob
 
+import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.ticker
@@ -38,13 +38,24 @@ def pick_file() -> str:
     return files[idx]
 
 
+def load_occ(csv_path: str):
+    """Load occupancy map saved alongside the CSV. Returns dict or None."""
+    occ_path = csv_path.replace('.csv', '_occ.npz')
+    if not os.path.exists(occ_path):
+        return None
+    return np.load(occ_path)
+
+
 def load(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     df['z_down_m'] = pd.to_numeric(df['z_down_m'], errors='coerce')
+    if 'state' not in df.columns:
+        df['state'] = ''
     for col in ('yaw_deg', 'roll_deg', 'pitch_deg', 'yaw_ref_deg',
                 'vx_ms', 'vy_ms', 'vz_ms',
                 'range_front_m', 'range_back_m',
-                'range_left_m', 'range_right_m', 'range_up_m'):
+                'range_left_m', 'range_right_m', 'range_up_m',
+                'target_x_m', 'target_y_m'):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
         else:
@@ -124,12 +135,23 @@ def compute_pairs(entries, exits):
 
 # ------------------------------------------------------------------ plot
 
-def plot(df: pd.DataFrame, title: str):
+def plot(df: pd.DataFrame, title: str, occ_data=None):
     t = df['time_s'].values
     # Convert EKF frame → arena frame
     x = df['x_m'].values + config.TAKEOFF_PAD_X
     y = df['y_m'].values + config.TAKEOFF_PAD_Y
     z = df['z_down_m'].values
+
+    # Target positions (unique, EKF → arena)
+    targets = []
+    if 'target_x_m' in df.columns:
+        tdf = df[df['target_x_m'] != ''][['target_x_m', 'target_y_m']].drop_duplicates()
+        if len(tdf):
+            tdf = tdf.apply(pd.to_numeric, errors='coerce').dropna()
+            targets = list(zip(
+                tdf['target_x_m'] + config.TAKEOFF_PAD_X,
+                tdf['target_y_m'] + config.TAKEOFF_PAD_Y,
+            ))
 
     entries, exits = detect_edges(df)
     # Apply arena offset to edge event positions
@@ -179,12 +201,39 @@ def plot(df: pd.DataFrame, title: str):
         sp.set_edgecolor('#aaa')
     ax2.tick_params(axis='both', which='both', colors='black', labelcolor='black')
 
+    # ---- occupancy map overlay
+    if occ_data is not None:
+        grid  = occ_data['grid']          # shape (rows=Y, cols=X)
+        res   = float(occ_data['res'][0])
+        x_min = float(occ_data['x_min'][0]) + config.TAKEOFF_PAD_X  # EKF → arena
+        y_min = float(occ_data['y_min'][0]) + config.TAKEOFF_PAD_Y
+        n_rows, n_cols = grid.shape
+        x_max = x_min + n_cols * res
+        y_max = y_min + n_rows * res
+
+        # RGBA: FREE=transparent, UNKNOWN=light gray, OCCUPIED=dark, INFLATED=mid gray
+        rgba = np.zeros((*grid.shape, 4), dtype=float)
+        rgba[grid == 1] = [0.80, 0.80, 0.80, 0.40]   # UNKNOWN
+        rgba[grid == 2] = [0.15, 0.15, 0.15, 0.75]   # OCCUPIED
+        rgba[grid == 3] = [0.55, 0.55, 0.55, 0.40]   # INFLATED
+
+        ax2.imshow(rgba, origin='lower',
+                   extent=[x_min, x_max, y_min, y_max],
+                   aspect='auto', zorder=1)
+
     sc = ax2.scatter(x, y, c=z, cmap='Reds',
                      s=20, vmin=z.min(), vmax=z.max(), zorder=2)
     cb = plt.colorbar(sc, ax=ax2, fraction=0.046, pad=0.04)
     cb.set_label('z_down (m)', color='black')
     cb.ax.yaxis.set_tick_params(color='black')
     plt.setp(cb.ax.yaxis.get_ticklabels(), color='black')
+
+    # target positions
+    if targets:
+        tx_arr, ty_arr = zip(*targets)
+        ax2.scatter(tx_arr, ty_arr, marker='*', color='gold', s=80,
+                    edgecolors='orange', linewidths=0.5,
+                    zorder=6, label=f'target ({len(targets)})')
 
     # entry/exit markers on XY
     if entries:
@@ -197,7 +246,7 @@ def plot(df: pd.DataFrame, title: str):
                     zorder=5, label=f'exit ({len(exits)})')
 
     # Matched pairs: entry → exit line + midpoint diamond
-    for i, (cx, cy, enx, eny, exx, exy) in enumerate(pairs):
+    for i, (_, _, enx, eny, exx, exy) in enumerate(pairs):
         lbl = f'Pair ({len(pairs)})' if i == 0 else ''
         ax2.plot([enx, exx], [eny, exy],
                  color='#ff8800', lw=1.5, zorder=4, label=lbl)
@@ -229,7 +278,12 @@ if __name__ == '__main__':
     path = pick_file()
     print(f'Loading: {path}')
     df = load(path)
+    occ_data = load_occ(path)
+    if occ_data is not None:
+        print(f'  occ map loaded: {occ_data["grid"].shape}')
+    else:
+        print('  occ map: not found')
     print(f'  {len(df)} rows  |  '
           f't=[{df.time_s.min():.2f}s, {df.time_s.max():.2f}s]  |  '
           f'z_down=[{df.z_down_m.min():.3f}, {df.z_down_m.max():.3f}] m')
-    plot(df, title=os.path.basename(path))
+    plot(df, title=os.path.basename(path), occ_data=occ_data)

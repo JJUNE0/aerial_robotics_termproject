@@ -10,6 +10,8 @@ State sequence:
 import math
 import threading
 import time
+
+import numpy as np
 from typing import Optional, Tuple
 
 import cflib.crtp
@@ -43,6 +45,11 @@ def _step(shared: SharedState, hub: SensorHub,
 
     shared.pose = data.pose
     shared.battery_pct = data.battery_pct
+    hub.set_state(shared.current_state)
+    if shared.target_pos is not None:
+        hub.set_target(*shared.target_pos)
+    else:
+        hub.clear_target()
 
     occ.update_all_rays(x, y, yaw, data.ranges)
 
@@ -113,11 +120,11 @@ def do_rotation_scan(cf, shared, hub, occ, hmap,
 
     duration = abs(angle_deg) / config.SCAN_ROTATE_RATE
     yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, angle_deg)  # deg/s
-    end_t = time.time() + duration
 
     hold_kp = 1.5
     max_hold_speed = min(0.08, config.NAV_SPEED)
 
+    end_t = time.time() + duration
     while time.time() < end_t:
         data = _step(shared, hub, occ, hmap)
         cx, cy, _, cyaw = data.pose
@@ -442,8 +449,17 @@ def run_mission(cf, shared: SharedState):
 
     finally:
         hub.stop()
+        try:
+            np.savez(logger.occ_path,
+                     grid=occ.snapshot(),
+                     res=np.array([config.OCCUPANCY_GRID_RES]),
+                     x_min=np.array([occ.x_min]),
+                     y_min=np.array([occ.y_min]))
+            print(f'[mission] occ map saved → {logger.occ_path}')
+        except Exception as e:
+            print(f'[mission] occ save failed: {e}')
         logger.close()
-        controller.disarm(cf)   # leave firmware in a clean state for next run
+        controller.disarm(cf)
 
 
 # ------------------------------------------------------------------ entry

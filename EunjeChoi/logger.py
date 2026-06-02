@@ -17,14 +17,30 @@ class FlightLogger:
         self._f = open(self._path, 'w', newline='')
         self._writer = csv.writer(self._f)
         self._writer.writerow([
-            'time_s', 'x_m', 'y_m', 'z_down_m',
+            'time_s', 'state', 'x_m', 'y_m', 'z_down_m',
             'yaw_deg', 'roll_deg', 'pitch_deg', 'yaw_ref_deg',
             'vx_ms', 'vy_ms', 'vz_ms',
             'range_front_m', 'range_back_m', 'range_left_m', 'range_right_m', 'range_up_m',
+            'target_x_m', 'target_y_m',
         ])
         self._t0 = time.time()
         self._row_count = 0
+        self._state = ''
+        self._target = None
         print(f'[logger] {self._path}')
+
+    @property
+    def occ_path(self) -> str:
+        return self._path.replace('.csv', '_occ.npz')
+
+    def set_state(self, state: str):
+        self._state = state
+
+    def set_target(self, x, y):
+        self._target = (x, y)
+
+    def clear_target(self):
+        self._target = None
 
     def log(self, x: float, y: float, z_down: Optional[float],
             yaw: float = 0.0, roll: float = 0.0, pitch: float = 0.0,
@@ -35,11 +51,14 @@ class FlightLogger:
             up: Optional[float] = None):
         t = round(time.time() - self._t0, 3)
         def _f(v): return '' if v is None else round(v, 4)
+        tx = '' if self._target is None else round(self._target[0], 4)
+        ty = '' if self._target is None else round(self._target[1], 4)
         self._writer.writerow([
-            t, round(x, 4), round(y, 4), _f(z_down),
+            t, self._state, round(x, 4), round(y, 4), _f(z_down),
             round(yaw, 2), round(roll, 2), round(pitch, 2), round(yaw_ref, 2),
             round(vx, 4), round(vy, 4), round(vz, 4),
             _f(front), _f(back), _f(left), _f(right), _f(up),
+            tx, ty,
         ])
         self._row_count += 1
         if self._row_count % self._FLUSH_EVERY == 0:

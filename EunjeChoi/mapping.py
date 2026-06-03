@@ -159,24 +159,34 @@ class OccupancyGrid:
 class PadCandidate:
     cx: float
     cy: float
+    pair_count: int = 0
+
+
+@dataclass
+class EdgeMark:
+    x: float
+    y: float
+    stamp: float
+    seq: int
 
 
 class HeightMap:
     """Detects landing pad from z-ranger edge events.
 
-    Strategy: pair entry/exit events on the same scan column (X proximity),
-    then group pairs spatially. A pad (30 cm) generates 2+ pairs with an
-    X-span >= PAD_MIN_CLUSTER_SPAN; a narrow bar (13 cm) generates at most 1.
+    Strategy: pair each exit with the nearest earlier unpaired entry, reject
+    crossings that are too short/long for a square pad side, then group valid
+    pair centers spatially.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._entries: List[Tuple[float, float]] = []
-        self._exits: List[Tuple[float, float]] = []
-        self._pairs: List[Tuple[float, float]] = []
+        self._entries: List[EdgeMark] = []
+        self._exits: List[EdgeMark] = []
+        self._pairs: List[Tuple[float, float, float, float, float, float]] = []
         self._candidates: List[PadCandidate] = []
         self._entry_seq: int = 0
         self._exit_seq: int = 0
+        self._edge_seq: int = 0
         self._last_entry_pos: Optional[Tuple[float, float]] = None
         self._last_exit_pos: Optional[Tuple[float, float]] = None
 
@@ -200,45 +210,57 @@ class HeightMap:
         with self._lock:
             return self._last_exit_pos
 
-    def add_entry(self, x: float, y: float):
+    def add_entry(self, x: float, y: float, stamp: Optional[float] = None):
         with self._lock:
-            self._entries.append((x, y))
+            self._edge_seq += 1
+            self._entries.append(EdgeMark(x, y, self._edge_seq if stamp is None else stamp,
+                                          self._edge_seq))
             self._entry_seq += 1
             self._last_entry_pos = (x, y)
 
-    def add_exit(self, x: float, y: float):
+    def add_exit(self, x: float, y: float, stamp: Optional[float] = None):
         with self._lock:
-            self._exits.append((x, y))
+            self._edge_seq += 1
+            self._exits.append(EdgeMark(x, y, self._edge_seq if stamp is None else stamp,
+                                        self._edge_seq))
             self._exit_seq += 1
             self._last_exit_pos = (x, y)
         self._recompute_candidates()
 
+    @staticmethod
+    def _valid_pad_pair(entry: EdgeMark, exit_: EdgeMark) -> bool:
+        dx = exit_.x - entry.x
+        dy = exit_.y - entry.y
+        along = max(abs(dx), abs(dy))
+        cross = min(abs(dx), abs(dy))
+        return (config.PAD_PAIR_MIN <= along <= config.PAD_PAIR_MAX and
+                cross <= config.PAIR_CROSS_AXIS_TOL)
+
     def _recompute_candidates(self):
         with self._lock:
-            # Pair each exit with the most recent unpaired entry (time-based).
-            # Valid pair: Euclidean distance ≥ PAIR_MIN_Y_SPAN (20 cm).
+            # Pair each exit with the most recent unpaired entry that happened
+            # before it. Invalid crossings are consumed and discarded.
             pairs = []
             used_entries = set()
 
-            for exx, exy in self._exits:
-                # Find most recent unpaired entry
+            for exit_ in self._exits:
                 best_j = None
                 for j in range(len(self._entries) - 1, -1, -1):
-                    if j not in used_entries:
+                    if j not in used_entries and self._entries[j].seq < exit_.seq:
                         best_j = j
                         break
 
                 if best_j is None:
                     continue
 
-                enx, eny = self._entries[best_j]
-                if math.hypot(enx - exx, eny - exy) < config.PAIR_MIN_Y_SPAN:
-                    continue   # too close — not a valid pad crossing
-
+                entry = self._entries[best_j]
                 used_entries.add(best_j)
-                cx = (enx + exx) / 2.0
-                cy = (eny + exy) / 2.0
-                pairs.append((cx, cy, enx, eny, exx, exy))
+                if not self._valid_pad_pair(entry, exit_):
+                    continue
+
+                cx = (entry.x + exit_.x) / 2.0
+                cy = (entry.y + exit_.y) / 2.0
+                pairs.append((cx, cy, entry.x, entry.y, exit_.x, exit_.y))
 
             self._pairs = list(pairs)
 
@@ -258,7 +280,8 @@ class HeightMap:
                         used.add(j)
                 gcx = sum(pairs[k][0] for k in group) / len(group)
                 gcy = sum(pairs[k][1] for k in group) / len(group)
-                candidates.append(PadCandidate(cx=gcx, cy=gcy))
+                candidates.append(PadCandidate(cx=gcx, cy=gcy,
+                                               pair_count=len(group)))
 
             self._candidates = candidates
 
@@ -278,6 +301,7 @@ class HeightMap:
             self._candidates.clear()
             self._entry_seq = 0
             self._exit_seq = 0
+            self._edge_seq = 0
             self._last_entry_pos = None
             self._last_exit_pos = None
             self._exits.clear()

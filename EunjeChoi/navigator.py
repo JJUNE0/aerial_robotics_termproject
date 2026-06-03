@@ -133,7 +133,9 @@ class FrontierNavigator:
         self._occ = occ_grid
 
     def find_max_x_target(self, drone_x: float, drone_y: float,
-                          x_limit: Optional[float] = None) -> Optional[Tuple[float, float]]:
+                          x_limit: Optional[float] = None,
+                          avoid_targets: Optional[List[Tuple[float, float]]] = None,
+                          avoid_radius: Optional[float] = None) -> Optional[Tuple[float, float]]:
         """Return world (x, y) of the farthest reachable cell in +x, or None."""
         grid = self._occ.snapshot()
         rows, cols = grid.shape
@@ -154,12 +156,22 @@ class FrontierNavigator:
         best_col = sc
         best_row = sr
         found = False
+        avoid_targets = avoid_targets or []
+        if avoid_radius is None:
+            avoid_radius = config.TARGET_BLOCK_RADIUS
+
+        def avoided(row: int, col: int) -> bool:
+            if not avoid_targets:
+                return False
+            wx, wy = self._occ.cell_to_world(row, col)
+            return any(math.hypot(wx - ax, wy - ay) < avoid_radius
+                       for ax, ay in avoid_targets)
 
         while queue:
             r, c = queue.popleft()
 
             # Only FREE cells count as valid destinations
-            if grid[r, c] == FREE and c > sc:
+            if grid[r, c] == FREE and c > sc and not avoided(r, c):
                 if not found or c > best_col or (
                         c == best_col and
                         abs(r - rows // 2) < abs(best_row - rows // 2)):

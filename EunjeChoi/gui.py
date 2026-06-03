@@ -175,6 +175,18 @@ class MissionGUI:
                 config.PAD_SIZE / 2 / config.OCCUPANCY_GRID_RES,
                 color='#ff8800', fill=False, linewidth=1.5, zorder=6))
 
+        local_region = self._shared.local_scan_region
+        if local_region is not None:
+            lx0, lx1, ly0, ly1 = local_region
+            cx = (lx0 + lx1) / 2.0
+            cy = (ly0 + ly1) / 2.0
+            radius = min(lx1 - lx0, ly1 - ly0) / 2.0
+            ax.add_patch(plt.Circle(
+                (wx_to_col(cx), wy_to_row(cy)),
+                radius / config.OCCUPANCY_GRID_RES,
+                fill=False, edgecolor='#00ff99', linewidth=1.8,
+                linestyle='--', zorder=7, label='Local scan'))
+
         # Takeoff-pad marker at EKF origin
         ax.plot(wx_to_col(0.0), wy_to_row(0.0),
                 'y^', markersize=6, zorder=5, label='Takeoff pad')
@@ -251,6 +263,17 @@ class MissionGUI:
                                     color='#ff8800', fill=False,
                                     linewidth=1.5, zorder=6))
 
+        local_region = shared.local_scan_region
+        if local_region is not None:
+            lx0, lx1, ly0, ly1 = local_region
+            cx = (lx0 + lx1) / 2.0
+            cy = (ly0 + ly1) / 2.0
+            radius = min(lx1 - lx0, ly1 - ly0) / 2.0
+            ax.add_patch(plt.Circle(
+                (cx + px, cy + py), radius,
+                fill=False, edgecolor='#00ff99', linewidth=1.8,
+                linestyle='--', zorder=6, label='Local scan'))
+
         # Drone marker
         ax.plot(drone_x + px, drone_y + py,
                 'co', markersize=7, zorder=5, label='Drone')
@@ -269,6 +292,6 @@ class MissionGUI:
         ax.set_ylabel('y (m)', color='white', fontsize=8)
         ax.set_aspect('equal', adjustable='box')
 
-        if edges or candidates or landing_target is not None:
+        if edges or candidates or landing_target is not None or local_region is not None:
             ax.legend(loc='upper right', fontsize=6,
                       facecolor='#333333', labelcolor='white', framealpha=0.8)

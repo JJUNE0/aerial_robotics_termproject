@@ -190,24 +190,19 @@ class SensorHub:
             self._timestamp = time.time()
             pose = self._pose
 
-        event = self._edge_detector.update(r.down, pose[0], pose[1])
-
         if self._logger is not None:
             with self._lock:
                 vel = self._velocity
                 att = self._attitude
                 yaw_ref = self._yaw_ref
-            edge_kind = '' if event is None else event.kind
-            edge_x = None if event is None else event.x
-            edge_y = None if event is None else event.y
             self._logger.log(
                 pose[0], pose[1], r.down,
                 pose[3], att[0], att[1], yaw_ref,
                 vel[0], vel[1], vel[2],
                 r.front, r.back, r.left, r.right, r.up,
-                edge_kind, edge_x, edge_y,
             )
 
+        event = self._edge_detector.update(r.down, pose[0], pose[1])
         if event is not None:
             self.edge_queue.put(event)
 
@@ -256,14 +251,6 @@ class SensorHub:
     def clear_target(self):
         if self._logger is not None:
             self._logger.clear_target()
-
-    def set_local_scan_region(self, region):
-        if self._logger is not None:
-            self._logger.set_local_scan_region(region)
-
-    def clear_local_scan_region(self):
-        if self._logger is not None:
-            self._logger.clear_local_scan_region()
 
     def reset_edge_detector(self):
         self._edge_detector.reset()

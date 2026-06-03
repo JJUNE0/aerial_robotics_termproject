@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 import matplotlib
 import matplotlib.ticker
-import matplotlib.patches as mpatches
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
@@ -52,24 +51,15 @@ def load(path: str) -> pd.DataFrame:
     df['z_down_m'] = pd.to_numeric(df['z_down_m'], errors='coerce')
     if 'state' not in df.columns:
         df['state'] = ''
-    if 'edge_event' not in df.columns:
-        df['edge_event'] = ''
     for col in ('yaw_deg', 'roll_deg', 'pitch_deg', 'yaw_ref_deg',
                 'vx_ms', 'vy_ms', 'vz_ms',
                 'range_front_m', 'range_back_m',
-                'range_left_m', 'range_right_m', 'range_up_m'):
+                'range_left_m', 'range_right_m', 'range_up_m',
+                'target_x_m', 'target_y_m'):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
         else:
             df[col] = 0.0
-    for col in ('target_x_m', 'target_y_m',
-                'local_x_min_m', 'local_x_max_m',
-                'local_y_min_m', 'local_y_max_m',
-                'edge_x_m', 'edge_y_m'):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        else:
-            df[col] = np.nan
     return df.dropna(subset=['z_down_m'])
 
 
@@ -82,19 +72,6 @@ def detect_edges(df: pd.DataFrame,
                  min_dz: float = config.EDGE_MIN_DZ,
                  cooldown: float = config.EDGE_COOLDOWN):
     """Return (entries, exits) each as list of (time, x, y)."""
-    if 'edge_event' in df.columns:
-        actual = df[df['edge_event'].isin(['entry', 'exit'])]
-        if len(actual):
-            entries = [
-                (row['time_s'], row['edge_x_m'], row['edge_y_m'])
-                for _, row in actual[actual['edge_event'] == 'entry'].iterrows()
-            ]
-            exits = [
-                (row['time_s'], row['edge_x_m'], row['edge_y_m'])
-                for _, row in actual[actual['edge_event'] == 'exit'].iterrows()
-            ]
-            return entries, exits
-
     entries, exits = [], []
 
     prev_z = prev_x = prev_y = prev_t = None
@@ -156,42 +133,6 @@ def compute_pairs(entries, exits):
     return pairs
 
 
-def local_scan_regions(df: pd.DataFrame):
-    cols = ['local_x_min_m', 'local_x_max_m', 'local_y_min_m', 'local_y_max_m']
-    if any(col not in df.columns for col in cols):
-        return []
-    rdf = df.dropna(subset=cols)[cols].drop_duplicates()
-    regions = []
-    for _, row in rdf.iterrows():
-        regions.append((
-            row['local_x_min_m'] + config.TAKEOFF_PAD_X,
-            row['local_x_max_m'] + config.TAKEOFF_PAD_X,
-            row['local_y_min_m'] + config.TAKEOFF_PAD_Y,
-            row['local_y_max_m'] + config.TAKEOFF_PAD_Y,
-        ))
-    return regions
-
-
-def local_scan_intervals(df: pd.DataFrame):
-    if 'state' not in df.columns:
-        return []
-    intervals = []
-    start_t = None
-    last_t = None
-    for _, row in df.iterrows():
-        active = row['state'] == 'LOCAL_EDGE_SCAN'
-        t = row['time_s']
-        if active and start_t is None:
-            start_t = t
-        elif not active and start_t is not None:
-            intervals.append((start_t, last_t))
-            start_t = None
-        last_t = t
-    if start_t is not None:
-        intervals.append((start_t, last_t))
-    return intervals
-
-
 # ------------------------------------------------------------------ plot
 
 def plot(df: pd.DataFrame, title: str, occ_data=None):
@@ -204,9 +145,9 @@ def plot(df: pd.DataFrame, title: str, occ_data=None):
     # Target positions (unique, EKF → arena)
     targets = []
     if 'target_x_m' in df.columns:
-        tdf = df.dropna(subset=['target_x_m', 'target_y_m'])[
-            ['target_x_m', 'target_y_m']].drop_duplicates()
+        tdf = df[df['target_x_m'] != ''][['target_x_m', 'target_y_m']].drop_duplicates()
         if len(tdf):
+            tdf = tdf.apply(pd.to_numeric, errors='coerce').dropna()
             targets = list(zip(
                 tdf['target_x_m'] + config.TAKEOFF_PAD_X,
                 tdf['target_y_m'] + config.TAKEOFF_PAD_Y,
@@ -219,8 +160,6 @@ def plot(df: pd.DataFrame, title: str, occ_data=None):
     exits   = [(te, ex + config.TAKEOFF_PAD_X, ey + config.TAKEOFF_PAD_Y)
                for te, ex, ey in exits]
     pairs = compute_pairs(entries, exits)
-    local_regions = local_scan_regions(df)
-    local_intervals = local_scan_intervals(df)
 
     # ---- figure layout: white background throughout
     plt.style.use('default')
@@ -235,10 +174,6 @@ def plot(df: pd.DataFrame, title: str, occ_data=None):
     ax1.tick_params(axis='both', which='both', colors='black', labelcolor='black')
 
     ax1.plot(t, z, color='#1a6faf', lw=1.2, zorder=2, label='z_down')
-
-    for i, (t0, t1) in enumerate(local_intervals):
-        ax1.axvspan(t0, t1, color='#00cc88', alpha=0.14, zorder=1,
-                    label='local scan' if i == 0 else '')
 
     # baseline
     ax1.axhline(config.EDGE_BASELINE, color='#888888', lw=1.0, linestyle='--',
@@ -315,16 +250,6 @@ def plot(df: pd.DataFrame, title: str, occ_data=None):
         lbl = f'Pair ({len(pairs)})' if i == 0 else ''
         ax2.plot([enx, exx], [eny, exy],
                  color='#ff8800', lw=1.5, zorder=4, label=lbl)
-
-    for i, (lx0, lx1, ly0, ly1) in enumerate(local_regions):
-        cx = (lx0 + lx1) / 2.0
-        cy = (ly0 + ly1) / 2.0
-        radius = min(lx1 - lx0, ly1 - ly0) / 2.0
-        ax2.add_patch(plt.Circle(
-            (cx, cy), radius,
-            fill=False, edgecolor='#00aa66', linewidth=1.8,
-            linestyle='--', zorder=6,
-            label='local scan region' if i == 0 else ''))
 
     ax2.plot(x[0],  y[0],  '^', color='green', ms=9, zorder=6, label='Start')
     ax2.plot(x[-1], y[-1], 's', color='black', ms=9, zorder=6, label='End')

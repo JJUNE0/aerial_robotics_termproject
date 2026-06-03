@@ -7,16 +7,6 @@ from cflib.crazyflie.log import LogConfig
 import config
 
 
-def arm(cf):
-    """Arm motors via supervisor."""
-    for _ in range(20):
-        if cf.supervisor.can_be_armed:
-            break
-        time.sleep(0.1)
-    cf.supervisor.send_arming_request(True)
-    time.sleep(0.5)
-
-
 def disarm(cf):
     """Stop motors and disarm."""
     try:
@@ -116,15 +106,17 @@ def takeoff_vel(cf, target_z: float, speed: float = 0.3, settle: float = 1.5):
 
 
 def land_vel(cf, hub, speed: float = 0.2):
-    """Ramp altitude down to 0 using velocity control, then disarm."""
+    """Ramp altitude down to 0 using velocity control, then stop motors."""
     print('[land] descending')
     z_cmd = hub.read().pose[2]
     while z_cmd > 0.05:
         z_cmd = max(z_cmd - speed * config.DT, 0.0)
         cf.commander.send_hover_setpoint(0, 0, 0, z_cmd)
         time.sleep(config.DT)
+    cf.commander.send_stop_setpoint()
+    time.sleep(0.5)
     disarm(cf)
-    print('[land] landed')
+    print('[land] landed and disarmed')
 
 
 def vel_to_body(vx_w: float, vy_w: float, yaw_deg: float):

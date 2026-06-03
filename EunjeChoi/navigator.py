@@ -15,36 +15,34 @@ def _passable(grid: np.ndarray, row: int, col: int) -> bool:
             grid[row, col] not in (OCCUPIED, INFLATED))
 
 
-def _passable_los(grid: np.ndarray, row: int, col: int) -> bool:
-    """Thick passability check used only for LOS pruning.
-
-    Checks the cell and its 8 neighbours so that a straight-line shortcut
-    is only accepted when the drone body — not just its centre — clears all
-    inflated zones.  INFLATION_RADIUS already adds DRONE_HALF_DIAGONAL around
-    each obstacle; one extra cell here guards against diagonal corner-cutting.
-    """
-    rows, cols = grid.shape
-    for dr in (-1, 0, 1):
-        for dc in (-1, 0, 1):
-            nr, nc = row + dr, col + dc
-            if 0 <= nr < rows and 0 <= nc < cols:
-                if grid[nr, nc] in (OCCUPIED, INFLATED):
-                    return False
-    return True
-
-
 def astar(grid: np.ndarray,
           start: Tuple[int, int],
           goal: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
-    """A* path on an occupancy grid snapshot. Returns list of (row, col) or None."""
+    """A* on occupancy grid — 4-directional only, clearance-weighted cost.
+
+    Cardinal-only movement ensures each path segment is purely horizontal or
+    vertical, so the drone never yaws during navigation.  Clearance cost biases
+    A* toward the centre of corridors (away from INFLATED/OCCUPIED cells).
+    """
     sr, sc = start
     gr, gc = goal
+    rows, cols = grid.shape
 
     if not _passable(grid, gr, gc):
         return None
 
     def h(r: int, c: int) -> float:
-        return math.hypot(r - gr, c - gc)
+        return abs(r - gr) + abs(c - gc)  # Manhattan — consistent with 4-dir
+
+    def clearance_penalty(r: int, c: int) -> float:
+        pen = 0.0
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                nr, nc = r + dr, c + dc
+                if (0 <= nr < rows and 0 <= nc < cols and
+                        grid[nr, nc] in (OCCUPIED, INFLATED)):
+                    pen += 0.2
+        return pen
 
     open_heap: list = []
     heapq.heappush(open_heap, (h(sr, sc), 0.0, sr, sc))
@@ -64,65 +62,36 @@ def astar(grid: np.ndarray,
             path.reverse()
             return path
 
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                nr, nc = r + dr, c + dc
-                if not _passable(grid, nr, nc):
-                    continue
-                # Block diagonal moves through tight corners: both cardinal
-                # neighbours must also be free so the drone body doesn't clip.
-                if dr != 0 and dc != 0:
-                    if not _passable(grid, r + dr, c) or not _passable(grid, r, c + dc):
-                        continue
-                step = math.sqrt(2) if (dr != 0 and dc != 0) else 1.0
-                ng = g + step
-                if ng < g_score.get((nr, nc), float('inf')):
-                    g_score[(nr, nc)] = ng
-                    came_from[(nr, nc)] = (r, c)
-                    heapq.heappush(open_heap, (ng + h(nr, nc), ng, nr, nc))
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if not _passable(grid, nr, nc):
+                continue
+            ng = g + 1.0 + clearance_penalty(nr, nc)
+            if ng < g_score.get((nr, nc), float('inf')):
+                g_score[(nr, nc)] = ng
+                came_from[(nr, nc)] = (r, c)
+                heapq.heappush(open_heap, (ng + h(nr, nc), ng, nr, nc))
 
     return None
 
 
 def simplify_path(path: List[Tuple[int, int]],
                   grid: np.ndarray) -> List[Tuple[int, int]]:
-    """Line-of-sight pruning: remove intermediate waypoints when LOS exists."""
+    """Merge consecutive collinear steps — keeps only direction-change points.
+
+    With 4-directional A*, each segment is already horizontal or vertical.
+    This collapses a run of same-direction steps into one direct waypoint so
+    the drone flies each cardinal leg in a single _navigate_to call.
+    """
     if len(path) <= 2:
         return path
-
-    def los(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
-        r0, c0 = a
-        r1, c1 = b
-        dr = abs(r1 - r0)
-        dc = abs(c1 - c0)
-        sr = 1 if r0 < r1 else -1
-        sc = 1 if c0 < c1 else -1
-        err = dr - dc
-        r, c = r0, c0
-        while (r, c) != (r1, c1):
-            if not _passable_los(grid, r, c):
-                return False
-            e2 = 2 * err
-            if e2 > -dc:
-                err -= dc
-                r += sr
-            if e2 < dr:
-                err += dr
-                c += sc
-        return _passable_los(grid, r1, c1)  # also verify endpoint
-
     simplified = [path[0]]
-    i = 0
-    while i < len(path) - 1:
-        j = len(path) - 1
-        while j > i + 1:
-            if los(path[i], path[j]):
-                break
-            j -= 1
-        simplified.append(path[j])
-        i = j
+    for i in range(1, len(path) - 1):
+        d1 = (path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1])
+        d2 = (path[i + 1][0] - path[i][0],  path[i + 1][1] - path[i][1])
+        if d1 != d2:
+            simplified.append(path[i])
+    simplified.append(path[-1])
     return simplified
 
 
@@ -133,9 +102,7 @@ class FrontierNavigator:
         self._occ = occ_grid
 
     def find_max_x_target(self, drone_x: float, drone_y: float,
-                          x_limit: Optional[float] = None,
-                          avoid_targets: Optional[List[Tuple[float, float]]] = None,
-                          avoid_radius: Optional[float] = None) -> Optional[Tuple[float, float]]:
+                          x_limit: Optional[float] = None) -> Optional[Tuple[float, float]]:
         """Return world (x, y) of the farthest reachable cell in +x, or None."""
         grid = self._occ.snapshot()
         rows, cols = grid.shape
@@ -156,22 +123,12 @@ class FrontierNavigator:
         best_col = sc
         best_row = sr
         found = False
-        avoid_targets = avoid_targets or []
-        if avoid_radius is None:
-            avoid_radius = config.TARGET_BLOCK_RADIUS
-
-        def avoided(row: int, col: int) -> bool:
-            if not avoid_targets:
-                return False
-            wx, wy = self._occ.cell_to_world(row, col)
-            return any(math.hypot(wx - ax, wy - ay) < avoid_radius
-                       for ax, ay in avoid_targets)
 
         while queue:
             r, c = queue.popleft()
 
             # Only FREE cells count as valid destinations
-            if grid[r, c] == FREE and c > sc and not avoided(r, c):
+            if grid[r, c] == FREE and c > sc:
                 if not found or c > best_col or (
                         c == best_col and
                         abs(r - rows // 2) < abs(best_row - rows // 2)):
@@ -186,11 +143,11 @@ class FrontierNavigator:
                     nr, nc = r + dr, c + dc
                     if nc > limit_col:
                         continue
-                    # Traverse FREE and UNKNOWN — UNKNOWN gaps should not block
-                    # exploration toward confirmed-FREE cells ahead
+                    # Traverse FREE cells only — prevents selecting targets
+                    # that are only reachable through unknown or inflated space
                     if (0 <= nr < rows and 0 <= nc < cols and
                             not visited[nr, nc] and
-                            grid[nr, nc] not in (OCCUPIED, INFLATED)):
+                            grid[nr, nc] == FREE):
                         visited[nr, nc] = True
                         queue.append((nr, nc))
 

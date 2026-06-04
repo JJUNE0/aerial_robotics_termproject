@@ -427,7 +427,7 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     _navigate_to(cf, shared, hub, occ, hmap,
                  pad_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
 
-    # Step 2: drain stale events, then approach in Y watching edge queue directly
+    # Step 2: drain stale events, sweep 1.5 s at SCAN_SPEED toward pad_y
     hub.reset_edge_detector()
     while not hub.edge_queue.empty():
         hub.edge_queue.get_nowait()
@@ -436,42 +436,35 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     _, cy, _, _ = data.pose
     approach_dy = 1.0 if pad_y >= cy else -1.0
     shared.target_pos = (pad_x, pad_y)
-    KP = 2.0
+
+    entry_t = None
 
     while True:
         data = _step(shared, hub, occ, hmap)
         cx, cy, _, cyaw = data.pose
 
-        # Poll edge queue directly — only active during this Y-approach
-        entry_detected = False
         while not hub.edge_queue.empty():
             ev = hub.edge_queue.get_nowait()
-            if ev.kind == 'entry':
-                entry_detected = True
+            if ev.kind == 'entry' and entry_t is None:
+                entry_t = time.time()
+                print(f'[land] edge entry at ({cx:.3f}, {cy:.3f}), landing in 1.5 s')
 
-        if entry_detected:
-            print(f'[land] edge entry at ({cx:.3f}, {cy:.3f})')
-            _navigate_to(cf, shared, hub, occ, hmap,
-                         cx, cy + approach_dy * 0.15,
-                         config.FLIGHT_Z, config.SCAN_SPEED)
-            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
-            time.sleep(1.0)
+        if entry_t is not None and time.time() - entry_t >= 1.5:
             break
 
-        dx, dy = pad_x - cx, pad_y - cy
-        dist = math.hypot(dx, dy)
-
-        if dist < config.NAV_ARRIVE_THRESHOLD:
-            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
-            time.sleep(1.0)
+        # Fallback: reached pad_y with no entry detected
+        if entry_t is None and abs(cy - pad_y) < config.NAV_ARRIVE_THRESHOLD:
+            print('[land] no entry detected, landing at pad_y')
             break
 
-        v = min(config.SCAN_SPEED, dist * KP)
-        vx_b, vy_b = controller.vel_to_body(
-            (dx / dist) * v, (dy / dist) * v, cyaw)
+        vx_w = max(-0.05, min(0.05, (pad_x - cx) * 2.0))
+        vy_w = approach_dy * config.SCAN_SPEED
+        vx_b, vy_b = controller.vel_to_body(vx_w, vy_w, cyaw)
         cf.commander.send_hover_setpoint(vx_b, vy_b, 0, config.FLIGHT_Z)
         time.sleep(config.DT)
 
+    cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+    time.sleep(1.0)
     shared.target_pos = None
     controller.land_vel(cf, hub)
 

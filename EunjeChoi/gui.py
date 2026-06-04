@@ -299,9 +299,8 @@ class MissionGUI:
 
         align_pos = shared.landing_align_pos
         if align_pos is not None:
-            ax.plot(wx_to_col(align_pos[0]), wy_to_row(align_pos[1]),
-                    '+', color='#00ccff', markersize=10, markeredgewidth=2,
-                    zorder=8)
+            ax.axvline(wx_to_col(align_pos[0]), color='#00ccff',
+                       linewidth=1.2, linestyle='--', alpha=0.85, zorder=8)
 
         patches = [
             mpatches.Patch(color='white',   label='Free'),
@@ -377,9 +376,9 @@ class MissionGUI:
 
         align_pos = shared.landing_align_pos
         if align_pos is not None:
-            ax.plot(wx_to_col(align_pos[0]), wy_to_row(align_pos[1]),
-                    '+', color='#00ccff', markersize=10, markeredgewidth=2,
-                    zorder=8, label='X-align')
+            ax.axvline(wx_to_col(align_pos[0]), color='#00ccff',
+                       linewidth=1.2, linestyle='--', alpha=0.85,
+                       zorder=8, label='X-align')
 
         # Cluster bounding boxes
         clusters = compute_diff_clusters(diff, res)

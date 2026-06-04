@@ -323,7 +323,8 @@ _CELL_RGB = {
 
 
 def _draw_map_ax(ax, npz, title: str,
-                 df: pd.DataFrame, is_diff: bool = False):
+                 df: pd.DataFrame, is_diff: bool = False,
+                 align_x_col=None):
     """Render one map panel (occupancy or diff) onto ax."""
     import matplotlib.patches as mpatches
 
@@ -392,6 +393,11 @@ def _draw_map_ax(ax, npz, title: str,
         ax.text(wx_to_col(rx), wy_to_row(y_top) - 2, lbl,
                 color='yellow', fontsize=6, ha='center', va='top', alpha=0.85)
 
+    # X-alignment line (cluster centre X used for landing approach)
+    if align_x_col is not None:
+        ax.axvline(align_x_col, color='#00ccff', linewidth=1.2,
+                   linestyle='--', alpha=0.85, zorder=7, label='X-align')
+
     # Diff cluster bounding boxes
     if is_diff and npz is not None:
         import matplotlib.patches as rect_patches
@@ -441,11 +447,24 @@ def plot_maps(csv_path: str, df: pd.DataFrame, maps: dict, title: str):
     fig.patch.set_facecolor('#1a1a1a')
     fig.suptitle(f'Final Map State — {title}', color='white', fontsize=11)
 
-    _draw_map_ax(axes[0, 0], maps.get('occ'),       'Navigation Map',              df)
-    _draw_map_ax(axes[0, 1], maps.get('scan_high'),  'High-Alt Scan Map (0.30 m)', df)
-    _draw_map_ax(axes[1, 0], maps.get('occ_low'),    'Low-Alt Scan Map (0.08 m)',  df)
+    # Compute X-alignment column from best pad cluster in diff map
+    align_x_col = None
+    diff_npz = maps.get('diff')
+    if diff_npz is not None:
+        clusters = _compute_diff_clusters(diff_npz['grid'], float(diff_npz['res'][0]))
+        pad_clusters = [c for c in clusters if c['is_pad']]
+        if pad_clusters:
+            best = min(pad_clusters, key=lambda c: abs(c['w_m'] - config.PAD_SIZE))
+            align_x_col = (best['col_min'] + best['col_max']) / 2.0
+
+    _draw_map_ax(axes[0, 0], maps.get('occ'),       'Navigation Map',              df,
+                 align_x_col=align_x_col)
+    _draw_map_ax(axes[0, 1], maps.get('scan_high'),  'High-Alt Scan Map (0.30 m)', df,
+                 align_x_col=align_x_col)
+    _draw_map_ax(axes[1, 0], maps.get('occ_low'),    'Low-Alt Scan Map (0.08 m)',  df,
+                 align_x_col=align_x_col)
     _draw_map_ax(axes[1, 1], maps.get('diff'),       'Diff Map (elevated objects)', df,
-                 is_diff=True)
+                 is_diff=True, align_x_col=align_x_col)
 
     plt.tight_layout()
 

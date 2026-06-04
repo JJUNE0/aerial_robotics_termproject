@@ -45,8 +45,8 @@ SCAN_ROW_SPACING = 0.1        # column spacing for Y-sweep lawnmower (m)
 PAIR_SAME_COL_TOL = 0.06      # max |entry_x - exit_x| to count as same column (m)
 PAIR_MIN_Y_SPAN   = 0.20      # min |entry_y - exit_y| for a valid pad crossing (m)
 EDGE_BASELINE        = FLIGHT_Z   # fixed baseline = cruise altitude (m)
-EDGE_ENTRY_DIP       = 0.05       # valley must be ≥5 cm below baseline → entry
-EDGE_EXIT_RISE       = 0.05       # peak must be ≥5 cm above baseline  → exit
+EDGE_ENTRY_DIP       = 0.03       # valley must be ≥5 cm below baseline → entry
+EDGE_EXIT_RISE       = 0.06       # peak must be ≥5 cm above baseline  → exit
 EDGE_MIN_DZ          = 0.008      # minimum |dz| per sample to register a direction change (m)
 EDGE_COOLDOWN        = 1.0        # seconds to suppress detection after entry or exit fires
 
@@ -59,12 +59,13 @@ PAD_CONFIRM_TIME = 0.6        # hover-confirm duration (s)
 
 # Dual-altitude pad detection
 LOW_SCAN_Z      = 0.08   # low-altitude scan height — below pad/bar (10 cm)
-LANDING_SCAN_X  = 4.5    # scan setpoint x in arena coords (m)
+LANDING_SCAN_X  = 4.7    # scan setpoint x in arena coords (m)
+LANDING_SCAN_Y  = 0.4    # scan setpoint y in arena coords (m)
 LANDING_SCAN_Y1 = 0.5    # scan setpoint y1 in arena coords (m)
 LANDING_SCAN_Y2 = 2.5    # scan setpoint y2 in arena coords (m)
-PAD_ASPECT_MAX  = 1.5    # max bounding-box aspect ratio to classify as pad
+PAD_LAND_OVERSHOOT = 0.08  # approach target: this far past pad centre in +X (m)
 PAD_BBOX_MIN    = 0.20   # min short side of bounding box (m)
-PAD_BBOX_MAX    = 0.40   # max long  side of bounding box (m)
+PAD_BBOX_MAX    = 0.50   # max long  side of bounding box (m)
 
 # Mission timer (display only — no forced actions)
 MISSION_TIME_LIMIT = 180.0

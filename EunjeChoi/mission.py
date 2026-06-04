@@ -344,17 +344,20 @@ def do_landing_region_scan(cf, shared, hub, occ, hmap):
     """
     shared.current_state = 'LANDING_REGION_SCAN'
 
-    # Navigate to scan x using frontier + A*
+    # Navigate to scan position (arena X=4.5, Y=0.5) using frontier + A* then fine approach
     sx = config.LANDING_SCAN_X - config.TAKEOFF_PAD_X
+    sy = config.LANDING_SCAN_Y - config.TAKEOFF_PAD_Y
     _nav_to_x(cf, shared, hub, occ, hmap, sx)
+    _navigate_to(cf, shared, hub, occ, hmap, sx, sy, config.FLIGHT_Z, config.NAV_SPEED)
 
     data = _step(shared, hub, occ, hmap)
-    print(f'[scan] scanning from x={data.pose[0]:.2f} (target sx={sx:.2f})')
+    print(f'[scan] scanning from ({data.pose[0]:.2f}, {data.pose[1]:.2f})'
+          f'  target=({sx:.2f}, {sy:.2f})')
 
     # ── Pass 1: FLIGHT_Z — dedicated scan map (independent from nav occ)
     occ_scan_high = OccupancyGrid()
     do_rotation_scan(cf, shared, hub, occ, hmap,
-                     angle_deg=90.0,
+                     angle_deg=180.0,
                      occ_target=occ_scan_high)
     shared.occ_scan_high_grid = occ_scan_high.snapshot()
 
@@ -363,7 +366,7 @@ def do_landing_region_scan(cf, shared, hub, occ, hmap):
     controller.takeoff_vel(cf, config.LOW_SCAN_Z, speed=0.15, settle=0.5)
 
     do_rotation_scan(cf, shared, hub, occ, hmap,
-                     angle_deg=90.0,
+                     angle_deg=180.0,
                      occ_target=occ_low,
                      scan_z=config.LOW_SCAN_Z,
                      freeze_occ=True)
@@ -416,8 +419,60 @@ def do_pad_confirm(cf, shared, hub, occ, hmap) -> Optional[Tuple[float, float]]:
 
 def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     shared.current_state = 'LANDING_ON_PAD'
+
+    # Step 1: align X with cluster centre, keeping current Y
+    data = _step(shared, hub, occ, hmap)
+    _, cy, _, _ = data.pose
+    shared.landing_align_pos = (pad_x, cy)
     _navigate_to(cf, shared, hub, occ, hmap,
-                 pad_x, pad_y, config.FLIGHT_Z, config.SCAN_SPEED)
+                 pad_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
+
+    # Step 2: drain stale events, then approach in Y watching edge queue directly
+    hub.reset_edge_detector()
+    while not hub.edge_queue.empty():
+        hub.edge_queue.get_nowait()
+
+    data = _step(shared, hub, occ, hmap)
+    _, cy, _, _ = data.pose
+    approach_dy = 1.0 if pad_y >= cy else -1.0
+    shared.target_pos = (pad_x, pad_y)
+    KP = 2.0
+
+    while True:
+        data = _step(shared, hub, occ, hmap)
+        cx, cy, _, cyaw = data.pose
+
+        # Poll edge queue directly — only active during this Y-approach
+        entry_detected = False
+        while not hub.edge_queue.empty():
+            ev = hub.edge_queue.get_nowait()
+            if ev.kind == 'entry':
+                entry_detected = True
+
+        if entry_detected:
+            print(f'[land] edge entry at ({cx:.3f}, {cy:.3f})')
+            _navigate_to(cf, shared, hub, occ, hmap,
+                         cx, cy + approach_dy * 0.15,
+                         config.FLIGHT_Z, config.SCAN_SPEED)
+            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+            time.sleep(1.0)
+            break
+
+        dx, dy = pad_x - cx, pad_y - cy
+        dist = math.hypot(dx, dy)
+
+        if dist < config.NAV_ARRIVE_THRESHOLD:
+            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+            time.sleep(1.0)
+            break
+
+        v = min(config.SCAN_SPEED, dist * KP)
+        vx_b, vy_b = controller.vel_to_body(
+            (dx / dist) * v, (dy / dist) * v, cyaw)
+        cf.commander.send_hover_setpoint(vx_b, vy_b, 0, config.FLIGHT_Z)
+        time.sleep(config.DT)
+
+    shared.target_pos = None
     controller.land_vel(cf, hub)
 
 

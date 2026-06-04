@@ -19,6 +19,7 @@ class SharedState:
         self._home_pos = (0.0, 0.0)           # EKF position recorded after takeoff stabilisation
         self._target_pos = None               # current nav target (x, y) or None
         self._landing_target = None           # confirmed landing pad position (x, y) or None
+        self._landing_align_pos = None        # X-alignment waypoint for pad landing (x, y) or None
         self._start_time = None
 
     # ------------------------------------------------------------------ timer
@@ -169,6 +170,18 @@ class SharedState:
     def landing_target(self, v):
         with self._lock:
             self._landing_target = v
+
+    # ------------------------------------------------------- landing align pos
+
+    @property
+    def landing_align_pos(self):
+        with self._lock:
+            return self._landing_align_pos
+
+    @landing_align_pos.setter
+    def landing_align_pos(self, v):
+        with self._lock:
+            self._landing_align_pos = v
 
     # ------------------------------------------------------- pad pairs
 

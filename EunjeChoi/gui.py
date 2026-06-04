@@ -5,12 +5,13 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
 from matplotlib.animation import FuncAnimation
+from matplotlib.ticker import MultipleLocator
 from matplotlib.widgets import Button
 
 import numpy as np
 
 import config
-from mapping import FREE, UNKNOWN, OCCUPIED, INFLATED
+from mapping import FREE, UNKNOWN, OCCUPIED, INFLATED, compute_diff_clusters
 from shared_state import SharedState
 
 _CELL_RGB = {
@@ -107,6 +108,15 @@ class MissionGUI:
 
     # ---------------------------------------------------------------- helpers
 
+    @staticmethod
+    def _setup_map_grid(ax):
+        """Add 10 cm minor grid lines to a map axes."""
+        step = 0.1 / config.OCCUPANCY_GRID_RES
+        ax.xaxis.set_minor_locator(MultipleLocator(step))
+        ax.yaxis.set_minor_locator(MultipleLocator(step))
+        ax.grid(True, which='minor', color='#2e2e2e', linewidth=0.3, zorder=2)
+        ax.grid(True, which='major', color='#444444', linewidth=0.5, zorder=2)
+
     def _draw_region_lines(self, ax, wx_to_col, wy_to_row):
         """Draw start/middle/landing region dividers with labels on any map axes."""
         x1 = config.START_REGION_X - config.TAKEOFF_PAD_X
@@ -181,6 +191,7 @@ class MissionGUI:
         ax.set_yticklabels([str(i) for i in range(int(config.ARENA_Y) + 1)],
                            fontsize=7)
         ax.set_ylabel('y (m)', color='white', fontsize=8)
+        self._setup_map_grid(ax)
 
         # Drone marker (EKF pos → same col/row mapping)
         ax.plot(wx_to_col(drone_x), wy_to_row(drone_y),
@@ -268,6 +279,7 @@ class MissionGUI:
                            fontsize=7)
         ax.set_xlabel('x (m)', color='white', fontsize=8)
         ax.set_ylabel('y (m)', color='white', fontsize=8)
+        self._setup_map_grid(ax)
 
         self._draw_region_lines(ax, wx_to_col, wy_to_row)
 
@@ -284,6 +296,12 @@ class MissionGUI:
                 (wx_to_col(lx), wy_to_row(ly)),
                 config.PAD_SIZE / 2 / res,
                 color='#ff8800', fill=False, linewidth=1.5, zorder=6))
+
+        align_pos = shared.landing_align_pos
+        if align_pos is not None:
+            ax.plot(wx_to_col(align_pos[0]), wy_to_row(align_pos[1]),
+                    '+', color='#00ccff', markersize=10, markeredgewidth=2,
+                    zorder=8)
 
         patches = [
             mpatches.Patch(color='white',   label='Free'),
@@ -339,6 +357,7 @@ class MissionGUI:
                            fontsize=7)
         ax.set_xlabel('x (m)', color='white', fontsize=8)
         ax.set_ylabel('y (m)', color='white', fontsize=8)
+        self._setup_map_grid(ax)
 
         self._draw_region_lines(ax, wx_to_col, wy_to_row)
 
@@ -356,9 +375,40 @@ class MissionGUI:
                 config.PAD_SIZE / 2 / res,
                 color='#ff8800', fill=False, linewidth=1.5, zorder=6))
 
+        align_pos = shared.landing_align_pos
+        if align_pos is not None:
+            ax.plot(wx_to_col(align_pos[0]), wy_to_row(align_pos[1]),
+                    '+', color='#00ccff', markersize=10, markeredgewidth=2,
+                    zorder=8, label='X-align')
+
+        # Cluster bounding boxes
+        clusters = compute_diff_clusters(diff, res)
+        first_pad = True
+        first_rej = True
+        for cl in clusters:
+            color = '#00ff88' if cl['is_pad'] else '#ff4444'
+            lbl = None
+            if cl['is_pad'] and first_pad:
+                lbl = 'Pad cand.'
+                first_pad = False
+            elif not cl['is_pad'] and first_rej:
+                lbl = 'Rejected'
+                first_rej = False
+            ax.add_patch(mpatches.Rectangle(
+                (cl['col_min'], cl['row_min']),
+                cl['col_max'] - cl['col_min'],
+                cl['row_max'] - cl['row_min'],
+                linewidth=1.5, edgecolor=color,
+                facecolor='none', zorder=8, label=lbl))
+            ax.text(cl['col_min'], cl['row_max'] + 1,
+                    f'X={cl["w_m"]*100:.0f} Y={cl["h_m"]*100:.0f}cm',
+                    color=color, fontsize=5.5, zorder=9, va='bottom')
+
         patches = [
             mpatches.Patch(color='#ff9900', label='Elevated (pad/bar)'),
             mpatches.Patch(color='#262626', label='Background'),
+            mpatches.Patch(color='#00ff88', fill=False, label='Pad cand.'),
+            mpatches.Patch(color='#ff4444', fill=False, label='Rejected'),
         ]
         ax.legend(handles=patches, loc='upper right', fontsize=6,
                   facecolor='#333333', labelcolor='white', framealpha=0.8)

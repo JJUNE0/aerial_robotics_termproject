@@ -184,7 +184,7 @@ def find_pad_from_diff(occ_high: 'OccupancyGrid',
 
     rows, cols = diff.shape
     visited = np.zeros_like(diff, dtype=bool)
-    best = None
+    candidates = []   # (score, wx, wy, w_m, h_m)
 
     for sr in range(rows):
         for sc in range(cols):
@@ -205,21 +205,73 @@ def find_pad_from_diff(occ_high: 'OccupancyGrid',
 
             rs = [p[0] for p in component]
             cs = [p[1] for p in component]
-            h_m = (max(rs) - min(rs)) * occ_low.res
-            w_m = (max(cs) - min(cs)) * occ_low.res
-            if h_m < 1e-3 or w_m < 1e-3:
+            h_m = (max(rs) - min(rs)) * occ_low.res   # Y-extent
+            w_m = (max(cs) - min(cs)) * occ_low.res   # X-extent
+            if h_m < 0.02 or w_m < 0.02:
                 continue
-            short, long_ = min(h_m, w_m), max(h_m, w_m)
-            if (long_ / short < config.PAD_ASPECT_MAX
-                    and config.PAD_BBOX_MIN < short
-                    and long_ < config.PAD_BBOX_MAX):
+            # Pad identified by X-extent ≈ 30 cm.
+            # Bars have only ≈13 cm X-width → filtered by PAD_BBOX_MIN.
+            if config.PAD_BBOX_MIN <= w_m <= config.PAD_BBOX_MAX:
                 cx_row = (max(rs) + min(rs)) / 2
                 cx_col = (max(cs) + min(cs)) / 2
                 wx, wy = occ_low.cell_to_world(int(cx_row), int(cx_col))
-                best = (wx, wy)
-                break
+                # Score: closeness of X-extent to PAD_SIZE (30 cm)
+                score = abs(w_m - config.PAD_SIZE)
+                print(f'[pad] candidate: X={w_m:.3f} m  Y={h_m:.3f} m  '
+                      f'pos=({wx:.3f}, {wy:.3f})  score={score:.3f}')
+                candidates.append((score, wx, wy))
 
+    if not candidates:
+        return None, diff.astype(np.int8)
+
+    # Pick candidate whose X-extent is closest to PAD_SIZE
+    candidates.sort(key=lambda c: c[0])
+    best = (candidates[0][1], candidates[0][2])
     return best, diff.astype(np.int8)
+
+
+def compute_diff_clusters(diff_array: np.ndarray, res: float) -> list:
+    """BFS connected components on a diff grid array.
+    Returns list of dicts: row_min/max, col_min/max, h_m, w_m, is_pad.
+    """
+    rows, cols = diff_array.shape
+    visited = np.zeros((rows, cols), dtype=bool)
+    clusters = []
+
+    for sr in range(rows):
+        for sc in range(cols):
+            if not diff_array[sr, sc] or visited[sr, sc]:
+                continue
+            component = []
+            queue = [(sr, sc)]
+            visited[sr, sc] = True
+            while queue:
+                r, c = queue.pop()
+                component.append((r, c))
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = r + dr, c + dc
+                    if (0 <= nr < rows and 0 <= nc < cols
+                            and diff_array[nr, nc] and not visited[nr, nc]):
+                        visited[nr, nc] = True
+                        queue.append((nr, nc))
+
+            rs_list = [p[0] for p in component]
+            cs_list = [p[1] for p in component]
+            h_m = (max(rs_list) - min(rs_list)) * res
+            w_m = (max(cs_list) - min(cs_list)) * res
+
+            if h_m < 0.02 or w_m < 0.02:
+                continue
+
+            is_pad = config.PAD_BBOX_MIN <= w_m <= config.PAD_BBOX_MAX
+            clusters.append({
+                'row_min': min(rs_list), 'row_max': max(rs_list),
+                'col_min': min(cs_list), 'col_max': max(cs_list),
+                'h_m': h_m, 'w_m': w_m,
+                'is_pad': is_pad,
+            })
+
+    return clusters
 
 
 # ---------------------------------------------------------------- HeightMap

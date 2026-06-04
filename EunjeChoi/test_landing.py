@@ -1,6 +1,6 @@
 """
 Landing-only test: takeoff → scan → land on pad.
-No navigation to landing region; drone scans from wherever it takes off.
+Scan position is a test-specific offset from the takeoff/home position.
 """
 
 import threading
@@ -17,13 +17,63 @@ from logger import FlightLogger
 from mapping import OccupancyGrid, HeightMap, find_pad_from_diff
 from mission import (
     EmergencyException,
+    _navigate_to,
+    _nav_to_x,
     _step,
+    do_rotation_scan,
     do_takeoff,
-    do_landing_region_scan,
     do_land_on_pad,
 )
 from sensors import SensorHub
 from shared_state import SharedState
+
+
+TEST_SCAN_OFFSET_X = 0.4
+
+
+def do_test_landing_scan(cf, shared, hub, occ, hmap):
+    """Scan for the landing pad from the test-specific scan point."""
+    home_x, home_y = shared.home_pos
+    sx = home_x
+    sy = home_y + TEST_SCAN_OFFSET_X
+
+    print(f'[test] scan target from home ({home_x:.2f}, {home_y:.2f})'
+          f' -> ({sx:.2f}, {sy:.2f})')
+
+    shared.current_state = 'LANDING_REGION_SCAN'
+    _nav_to_x(cf, shared, hub, occ, hmap, sx)
+    _navigate_to(cf, shared, hub, occ, hmap, sx, sy,
+                 config.FLIGHT_Z, config.NAV_SPEED)
+
+    data = _step(shared, hub, occ, hmap)
+    print(f'[scan] scanning from ({data.pose[0]:.2f}, {data.pose[1]:.2f})'
+          f'  target=({sx:.2f}, {sy:.2f})')
+
+    occ_scan_high = OccupancyGrid()
+    do_rotation_scan(cf, shared, hub, occ, hmap,
+                     angle_deg=180.0,
+                     occ_target=occ_scan_high)
+    shared.occ_scan_high_grid = occ_scan_high.snapshot()
+
+    occ_low = OccupancyGrid()
+    controller.takeoff_vel(cf, config.LOW_SCAN_Z, speed=0.15, settle=0.5)
+
+    do_rotation_scan(cf, shared, hub, occ, hmap,
+                     angle_deg=180.0,
+                     occ_target=occ_low,
+                     scan_z=config.LOW_SCAN_Z,
+                     freeze_occ=True)
+    shared.occ_low_grid = occ_low.snapshot()
+
+    controller.takeoff_vel(cf, config.FLIGHT_Z, speed=0.15, settle=0.5)
+
+    pad_pos, diff_grid = find_pad_from_diff(occ_scan_high, occ_low)
+    shared.occ_diff_grid = diff_grid
+    if pad_pos is not None:
+        print(f'[scan] pad found at EKF ({pad_pos[0]:.3f}, {pad_pos[1]:.3f})')
+    else:
+        print('[scan] pad not found from diff map')
+    return pad_pos
 
 
 def run_test(cf, shared: SharedState):
@@ -36,7 +86,7 @@ def run_test(cf, shared: SharedState):
     try:
         do_takeoff(cf, shared, hub, occ, hmap)
 
-        pad_pos = do_landing_region_scan(cf, shared, hub, occ, hmap)
+        pad_pos = do_test_landing_scan(cf, shared, hub, occ, hmap)
 
         if pad_pos is not None:
             shared.landing_target = pad_pos

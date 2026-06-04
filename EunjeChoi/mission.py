@@ -36,7 +36,8 @@ class EmergencyException(Exception):
 
 def _step(shared: SharedState, hub: SensorHub,
           occ: OccupancyGrid, hmap: HeightMap,
-          update_occ: bool = True) -> SensorData:
+          update_occ: bool = True,
+          consume_edges: bool = True) -> SensorData:
     """Read sensors, update maps, push state to SharedState. Raise on emergency."""
     if shared.emergency_flag:
         raise EmergencyException()
@@ -55,14 +56,15 @@ def _step(shared: SharedState, hub: SensorHub,
     if update_occ:
         occ.update_all_rays(x, y, yaw, data.ranges)
 
-    while not hub.edge_queue.empty():
-        ev = hub.edge_queue.get_nowait()
-        if shared.current_state == 'LANDING_REGION_SCAN':
-            if ev.kind == 'entry':
-                hmap.add_entry(ev.x, ev.y)
-            else:
-                hmap.add_exit(ev.x, ev.y)
-            shared.add_height_map_edge(ev)
+    if consume_edges:
+        while not hub.edge_queue.empty():
+            ev = hub.edge_queue.get_nowait()
+            if shared.current_state == 'LANDING_REGION_SCAN':
+                if ev.kind == 'entry':
+                    hmap.add_entry(ev.x, ev.y)
+                else:
+                    hmap.add_exit(ev.x, ev.y)
+                shared.add_height_map_edge(ev)
 
     shared.occupancy_grid = occ.snapshot()
     shared.pad_pairs = hmap.get_pairs()
@@ -427,41 +429,78 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     _navigate_to(cf, shared, hub, occ, hmap,
                  pad_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
 
-    # Step 2: drain stale events, sweep 1.5 s at SCAN_SPEED toward pad_y
+    # Step 2: search past the estimated entry edge; if entry is detected,
+    # move a fixed distance from that measured edge before landing.
     hub.reset_edge_detector()
     while not hub.edge_queue.empty():
         hub.edge_queue.get_nowait()
 
-    data = _step(shared, hub, occ, hmap)
+    data = _step(shared, hub, occ, hmap, consume_edges=False)
     _, cy, _, _ = data.pose
     approach_dy = 1.0 if pad_y >= cy else -1.0
-    shared.target_pos = (pad_x, pad_y)
+    start_y = cy
+    estimated_edge_y = pad_y - approach_dy * (config.PAD_SIZE / 2.0)
+    edge_dist = approach_dy * (estimated_edge_y - start_y)
+    search_dist = max(0.0, edge_dist) + config.PAD_LAND_SEARCH_MARGIN
+    search_target_y = start_y + approach_dy * search_dist
+    shared.target_pos = (pad_x, search_target_y)
 
-    entry_t = None
+    entry_pos = None
+    entry_target_y = None
+    second_edge_pos = None
+    land_reason = None
+    print(f'[land] searching to estimated edge + {config.PAD_LAND_SEARCH_MARGIN:.2f} m'
+          f'  target=({pad_x:.3f}, {search_target_y:.3f})')
 
     while True:
-        data = _step(shared, hub, occ, hmap)
+        data = _step(shared, hub, occ, hmap, consume_edges=False)
         cx, cy, _, cyaw = data.pose
 
         while not hub.edge_queue.empty():
             ev = hub.edge_queue.get_nowait()
-            if ev.kind == 'entry' and entry_t is None:
-                entry_t = time.time()
-                print(f'[land] edge entry at ({cx:.3f}, {cy:.3f}), landing in 1.5 s')
+            shared.add_height_map_edge(ev)
+            if ev.kind == 'entry' and entry_pos is None:
+                entry_pos = (ev.x, ev.y)
+                entry_target_y = ev.y + approach_dy * config.PAD_LAND_ENTRY_OVERSHOOT
+                shared.target_pos = (pad_x, entry_target_y)
+                print(f'[land] edge entry at ({ev.x:.3f}, {ev.y:.3f}),'
+                      f' target +{config.PAD_LAND_ENTRY_OVERSHOOT:.2f} m'
+                      f' -> ({pad_x:.3f}, {entry_target_y:.3f})')
+            elif entry_pos is not None and second_edge_pos is None:
+                second_edge_pos = (ev.x, ev.y)
+                land_reason = f'{ev.kind}_edge'
+                print(f'[land] second edge ({ev.kind}) at ({ev.x:.3f}, {ev.y:.3f}),'
+                      ' landing after hover')
 
-        if entry_t is not None and time.time() - entry_t >= 1.5:
+        if second_edge_pos is not None:
             break
 
-        # Fallback: reached pad_y with no entry detected
-        if entry_t is None and abs(cy - pad_y) < config.NAV_ARRIVE_THRESHOLD:
-            print('[land] no entry detected, landing at pad_y')
-            break
+        if entry_pos is not None:
+            pushed_dist = approach_dy * (cy - entry_pos[1])
+            if pushed_dist >= config.PAD_LAND_ENTRY_OVERSHOOT:
+                land_reason = 'distance'
+                break
+        else:
+            search_progress = approach_dy * (cy - start_y)
+            if search_progress >= search_dist:
+                land_reason = 'estimated_edge_distance'
+                print('[land] no entry detected; reached estimated edge'
+                      f' + {config.PAD_LAND_SEARCH_MARGIN:.2f} m, landing after hover')
+                break
 
         vx_w = max(-0.05, min(0.05, (pad_x - cx) * 2.0))
-        vy_w = approach_dy * config.SCAN_SPEED
+        vy_w = approach_dy * config.PAD_LAND_PUSH_SPEED
         vx_b, vy_b = controller.vel_to_body(vx_w, vy_w, cyaw)
         cf.commander.send_hover_setpoint(vx_b, vy_b, 0, config.FLIGHT_Z)
         time.sleep(config.DT)
+
+    if entry_pos is not None:
+        data = _step(shared, hub, occ, hmap, consume_edges=False)
+        dx = data.pose[0] - entry_pos[0]
+        dy = data.pose[1] - entry_pos[1]
+        print(f'[land] pushed {math.hypot(dx, dy):.3f} m after entry'
+              f'  y_axis={approach_dy * dy:.3f} m'
+              f'  reason={land_reason}')
 
     cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
     time.sleep(1.0)

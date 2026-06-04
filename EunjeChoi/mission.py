@@ -2,9 +2,28 @@
 Autonomous Level-3 round-trip mission for Crazyflie 2.1 Brushless.
 
 State sequence:
-  TAKEOFF → ROTATION_SCAN → NAV_TO_LANDING → LANDING_REGION_SCAN
-  → PAD_CONFIRM → LANDING_ON_PAD → TAKEOFF_FROM_PAD → TURN_AROUND
-  → NAV_TO_START → LANDING_ON_START → DONE
+  TAKEOFF
+  → ROTATION_SCAN
+  → NAV_TO_LANDING
+      NAV_FRONTIER   : BFS로 다음 frontier 탐색 중
+      NAV_WAYPOINT   : A* waypoint 이동 중
+      NAV_RECOVER_Y  : 막혀서 Y방향 복구 이동
+      NAV_RECOVER_X  : 막혀서 X방향 nudge 이동
+      ROTATION_SCAN  : 막힘 복구용 스캔
+  → SCAN_NAV_FRONTIER / SCAN_NAV_WAYPOINT / ...  (스캔 위치까지 이동)
+  → SCAN_HIGH        : 고고도 180° 회전 스캔
+  → SCAN_LOW         : 저고도 180° 회전 스캔
+  → LANDING_REGION_SCAN (스캔 완료 후 diff 계산)
+  → LAND_X_ALIGN     : pad X 중앙으로 정렬
+  → LAND_APPROACH    : pad Y 방향 접근
+  → LAND_ENTRY       : entry edge 감지됨, 계속 전진
+  → LAND_HOVER       : 착지 전 1s 호버
+  → TAKEOFF_FROM_PAD
+  → TURN_AROUND
+  → NAV_TO_START
+      RET_FRONTIER / RET_WAYPOINT / RET_RECOVER_Y / RET_RECOVER_X
+  → LANDING_ON_START
+  → DONE
 """
 
 import math
@@ -118,13 +137,15 @@ def do_rotation_scan(cf, shared, hub, occ, hmap,
                      angle_deg: float = config.SCAN_ROTATE_ANGLE,
                      occ_target: Optional[OccupancyGrid] = None,
                      scan_z: Optional[float] = None,
-                     freeze_occ: bool = False):
+                     freeze_occ: bool = False,
+                     state: str = 'ROTATION_SCAN'):
     """Rotate with yaw-rate control while holding the scan start position.
 
     occ_target: if set, sensor rays are also recorded into this grid.
     scan_z: altitude to hold (defaults to FLIGHT_Z).
+    state: shared.current_state label to use during this scan.
     """
-    shared.current_state = 'ROTATION_SCAN'
+    shared.current_state = state
     z = scan_z if scan_z is not None else config.FLIGHT_Z
 
     data = _step(shared, hub, occ, hmap, update_occ=not freeze_occ)
@@ -267,12 +288,12 @@ def _navigate_to(cf, shared, hub, occ, hmap,
         time.sleep(config.DT)
 
 
-def _nav_to_x(cf, shared, hub, occ, hmap, target_x: float):
+def _nav_to_x(cf, shared, hub, occ, hmap, target_x: float, prefix: str = 'NAV'):
     """Frontier + A* navigation toward target_x, doing rotation scans when stuck."""
     frontier = FrontierNavigator(occ)
     y_center = config.ARENA_Y / 2.0 - config.TAKEOFF_PAD_Y
     failed_plans = 0
-    MAX_FAILED = 5
+    MAX_FAILED = 2
 
     while True:
         data = _step(shared, hub, occ, hmap)
@@ -282,21 +303,35 @@ def _nav_to_x(cf, shared, hub, occ, hmap, target_x: float):
             break
 
         if target_x - cx <= 0.20:
+            shared.current_state = f'{prefix}_WAYPOINT'
             _navigate_to(cf, shared, hub, occ, hmap,
                          target_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
             break
 
-        target = frontier.find_max_x_target(cx, cy, x_limit=target_x)
+        shared.current_state = f'{prefix}_FRONTIER'
+        target = frontier.find_max_x_target(cx, cy, x_limit=min(target_x, cx + 1.25))
         if target is None or target[0] <= cx + 0.1:
+            shared.frontier_target = None
+            shared.nav_waypoints = []
+            hub.clear_frontier()
             failed_plans += 1
             if failed_plans >= MAX_FAILED:
                 do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
                 failed_plans = 0
             elif abs(cy - y_center) > 0.10:
+                shared.current_state = f'{prefix}_RECOVER_Y'
                 step = 0.20 * (1 if y_center > cy else -1)
                 _navigate_to(cf, shared, hub, occ, hmap,
                              cx, cy + step, config.FLIGHT_Z, config.NAV_SPEED)
+            else:
+                shared.current_state = f'{prefix}_RECOVER_X'
+                nudge_x = min(cx + 0.20, target_x)
+                _navigate_to(cf, shared, hub, occ, hmap,
+                             nudge_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
             continue
+
+        shared.frontier_target = target
+        hub.set_frontier(target[0], target[1])
 
         grid = occ.snapshot()
         path = astar(grid,
@@ -304,18 +339,27 @@ def _nav_to_x(cf, shared, hub, occ, hmap, target_x: float):
                      occ.world_to_cell(target[0], target[1]))
 
         if path is None or len(path) <= 1:
+            shared.nav_waypoints = []
             failed_plans += 1
             if failed_plans >= MAX_FAILED:
                 do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
                 failed_plans = 0
             elif abs(cy - y_center) > 0.10:
+                shared.current_state = f'{prefix}_RECOVER_Y'
                 step = 0.20 * (1 if y_center > cy else -1)
                 _navigate_to(cf, shared, hub, occ, hmap,
                              cx, cy + step, config.FLIGHT_Z, config.NAV_SPEED)
+            else:
+                shared.current_state = f'{prefix}_RECOVER_X'
+                nudge_x = min(cx + 0.20, target_x)
+                _navigate_to(cf, shared, hub, occ, hmap,
+                             nudge_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
             continue
 
         failed_plans = 0
         path = simplify_path(path, grid)
+        shared.nav_waypoints = [occ.cell_to_world(pr, pc) for pr, pc in path[1:]]
+        shared.current_state = f'{prefix}_WAYPOINT'
         nav_ok = True
         for pr, pc in path[1:]:
             pwx, pwy = occ.cell_to_world(pr, pc)
@@ -323,11 +367,18 @@ def _nav_to_x(cf, shared, hub, occ, hmap, target_x: float):
                                 pwx, pwy, config.FLIGHT_Z, config.NAV_SPEED):
                 nav_ok = False
                 break
-        if not nav_ok:
+        shared.nav_waypoints = []
+        if nav_ok:
+            do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
+        else:
             failed_plans += 1
             if failed_plans >= MAX_FAILED:
                 do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
                 failed_plans = 0
+
+    shared.frontier_target = None
+    shared.nav_waypoints = []
+    hub.clear_frontier()
 
 
 def do_nav_to_landing(cf, shared, hub, occ, hmap):
@@ -349,7 +400,8 @@ def do_landing_region_scan(cf, shared, hub, occ, hmap):
     # Navigate to scan position (arena X=4.5, Y=0.5) using frontier + A* then fine approach
     sx = config.LANDING_SCAN_X - config.TAKEOFF_PAD_X
     sy = config.LANDING_SCAN_Y - config.TAKEOFF_PAD_Y
-    _nav_to_x(cf, shared, hub, occ, hmap, sx)
+    _nav_to_x(cf, shared, hub, occ, hmap, sx, prefix='SCAN_NAV')
+    shared.current_state = 'LANDING_REGION_SCAN'
     _navigate_to(cf, shared, hub, occ, hmap, sx, sy, config.FLIGHT_Z, config.NAV_SPEED)
 
     data = _step(shared, hub, occ, hmap)
@@ -360,7 +412,8 @@ def do_landing_region_scan(cf, shared, hub, occ, hmap):
     occ_scan_high = OccupancyGrid()
     do_rotation_scan(cf, shared, hub, occ, hmap,
                      angle_deg=180.0,
-                     occ_target=occ_scan_high)
+                     occ_target=occ_scan_high,
+                     state='SCAN_HIGH')
     shared.occ_scan_high_grid = occ_scan_high.snapshot()
 
     # ── Pass 2: LOW_SCAN_Z
@@ -371,7 +424,8 @@ def do_landing_region_scan(cf, shared, hub, occ, hmap):
                      angle_deg=180.0,
                      occ_target=occ_low,
                      scan_z=config.LOW_SCAN_Z,
-                     freeze_occ=True)
+                     freeze_occ=True,
+                     state='SCAN_LOW')
     shared.occ_low_grid = occ_low.snapshot()
 
     controller.takeoff_vel(cf, config.FLIGHT_Z, speed=0.15, settle=0.5)
@@ -423,6 +477,7 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     shared.current_state = 'LANDING_ON_PAD'
 
     # Step 1: align X with cluster centre, keeping current Y
+    shared.current_state = 'LAND_X_ALIGN'
     data = _step(shared, hub, occ, hmap)
     _, cy, _, _ = data.pose
     shared.landing_align_pos = (pad_x, cy)
@@ -445,6 +500,7 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     search_target_y = start_y + approach_dy * search_dist
     shared.target_pos = (pad_x, search_target_y)
 
+    shared.current_state = 'LAND_APPROACH'
     entry_pos = None
     entry_target_y = None
     second_edge_pos = None
@@ -463,6 +519,7 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
                 entry_pos = (ev.x, ev.y)
                 entry_target_y = ev.y + approach_dy * config.PAD_LAND_ENTRY_OVERSHOOT
                 shared.target_pos = (pad_x, entry_target_y)
+                shared.current_state = 'LAND_ENTRY'
                 print(f'[land] edge entry at ({ev.x:.3f}, {ev.y:.3f}),'
                       f' target +{config.PAD_LAND_ENTRY_OVERSHOOT:.2f} m'
                       f' -> ({pad_x:.3f}, {entry_target_y:.3f})')
@@ -502,6 +559,7 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
               f'  y_axis={approach_dy * dy:.3f} m'
               f'  reason={land_reason}')
 
+    shared.current_state = 'LAND_HOVER'
     cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
     time.sleep(1.0)
     shared.target_pos = None
@@ -526,49 +584,111 @@ def do_turn_around(cf, shared, hub, occ, hmap):
     do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
 
 
-def do_nav_to_start(cf, shared, hub, occ, hmap):
-    shared.current_state = 'NAV_TO_START'
-    data = _step(shared, hub, occ, hmap)
-    cx, cy, cz, _ = data.pose
+def _nav_to_home(cf, shared, hub, occ_return: OccupancyGrid, hmap, home_x: float):
+    """Navigate in -X direction with a fresh map, mirroring _nav_to_x."""
+    frontier = FrontierNavigator(occ_return)
+    y_center = config.ARENA_Y / 2.0 - config.TAKEOFF_PAD_Y
+    failed_plans = 0
+    MAX_FAILED = 2
 
-    hx, hy = shared.home_pos
-    gr, gc = occ.world_to_cell(hx, hy)
+    while True:
+        data = _step(shared, hub, occ_return, hmap)
+        cx, cy, _, _ = data.pose
 
-    def _plan(ox, oy):
-        g = occ.snapshot()
-        sr, sc = occ.world_to_cell(ox, oy)
-        p = astar(g, (sr, sc), (gr, gc))
-        if p is not None and len(p) > 1:
-            p = simplify_path(p, g)
-            return [occ.cell_to_world(r, c) for r, c in p[1:]]
-        return [(hx, hy)]
-
-    waypoints = _plan(cx, cy)
-    max_replans = 3
-    replans = 0
-    i = 0
-
-    while i < len(waypoints):
-        wx, wy = waypoints[i]
-        arrived = _navigate_to(cf, shared, hub, occ, hmap,
-                               wx, wy, config.FLIGHT_Z, config.NAV_SPEED)
-        if arrived:
-            i += 1
-            continue
-
-        do_rotation_scan(cf, shared, hub, occ, hmap)
-        replans += 1
-        if replans > max_replans:
+        if cx <= home_x:
             break
 
-        data = _step(shared, hub, occ, hmap)
-        cx, cy, _, _ = data.pose
-        new_wps = _plan(cx, cy)
-        if new_wps != [(0.0, 0.0)] or (cx ** 2 + cy ** 2) > 0.25:
-            waypoints = new_wps
-            i = 0
+        if cx - home_x <= 0.20:
+            _navigate_to(cf, shared, hub, occ_return, hmap,
+                         home_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
+            break
+
+        shared.current_state = 'RET_FRONTIER'
+        target = frontier.find_min_x_target(cx, cy, x_limit=max(home_x, cx - 1.25))
+        if target is None or target[0] >= cx - 0.1:
+            shared.frontier_target = None
+            shared.nav_waypoints = []
+            hub.clear_frontier()
+            failed_plans += 1
+            if failed_plans >= MAX_FAILED:
+                do_rotation_scan(cf, shared, hub, occ_return, hmap, angle_deg=90.0)
+                failed_plans = 0
+            elif abs(cy - y_center) > 0.10:
+                shared.current_state = 'RET_RECOVER_Y'
+                step = 0.20 * (1 if y_center > cy else -1)
+                _navigate_to(cf, shared, hub, occ_return, hmap,
+                             cx, cy + step, config.FLIGHT_Z, config.NAV_SPEED)
+            else:
+                shared.current_state = 'RET_RECOVER_X'
+                nudge_x = max(cx - 0.20, home_x)
+                _navigate_to(cf, shared, hub, occ_return, hmap,
+                             nudge_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
+            continue
+
+        shared.frontier_target = target
+        hub.set_frontier(target[0], target[1])
+
+        grid_snap = occ_return.snapshot()
+        path = astar(grid_snap,
+                     occ_return.world_to_cell(cx, cy),
+                     occ_return.world_to_cell(target[0], target[1]))
+
+        if path is None or len(path) <= 1:
+            shared.nav_waypoints = []
+            failed_plans += 1
+            if failed_plans >= MAX_FAILED:
+                do_rotation_scan(cf, shared, hub, occ_return, hmap, angle_deg=90.0)
+                failed_plans = 0
+            elif abs(cy - y_center) > 0.10:
+                shared.current_state = 'RET_RECOVER_Y'
+                step = 0.20 * (1 if y_center > cy else -1)
+                _navigate_to(cf, shared, hub, occ_return, hmap,
+                             cx, cy + step, config.FLIGHT_Z, config.NAV_SPEED)
+            else:
+                shared.current_state = 'RET_RECOVER_X'
+                nudge_x = max(cx - 0.20, home_x)
+                _navigate_to(cf, shared, hub, occ_return, hmap,
+                             nudge_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
+            continue
+
+        failed_plans = 0
+        path = simplify_path(path, grid_snap)
+        shared.nav_waypoints = [occ_return.cell_to_world(pr, pc) for pr, pc in path[1:]]
+        shared.current_state = 'RET_WAYPOINT'
+        nav_ok = True
+        for pr, pc in path[1:]:
+            pwx, pwy = occ_return.cell_to_world(pr, pc)
+            if not _navigate_to(cf, shared, hub, occ_return, hmap,
+                                pwx, pwy, config.FLIGHT_Z, config.NAV_SPEED):
+                nav_ok = False
+                break
+        shared.nav_waypoints = []
+        if nav_ok:
+            do_rotation_scan(cf, shared, hub, occ_return, hmap, angle_deg=90.0)
         else:
-            i += 1   # can't replan — skip to next waypoint
+            failed_plans += 1
+            if failed_plans >= MAX_FAILED:
+                do_rotation_scan(cf, shared, hub, occ_return, hmap, angle_deg=90.0)
+                failed_plans = 0
+
+    shared.frontier_target = None
+    shared.nav_waypoints = []
+    hub.clear_frontier()
+
+
+def do_nav_to_start(cf, shared, hub, _occ, hmap):
+    shared.current_state = 'NAV_TO_START'
+    rx = config.RETURN_SCAN_X - config.TAKEOFF_PAD_X   # EKF coords
+    ry = config.RETURN_SCAN_Y - config.TAKEOFF_PAD_Y
+    occ_return = OccupancyGrid()
+    _nav_to_home(cf, shared, hub, occ_return, hmap, rx)
+    shared.current_state = 'NAV_TO_START'
+    _navigate_to(cf, shared, hub, occ_return, hmap,
+                 rx, ry, config.FLIGHT_Z, config.NAV_SPEED)
+    do_rotation_scan(cf, shared, hub, occ_return, hmap,
+                     angle_deg=180.0, state='RETURN_SCAN')
+    shared.current_state = 'NAV_TO_START'
+    shared.occ_return_grid = occ_return.snapshot()
 
 
 def do_land_on_start(cf, shared, hub, occ, hmap):
@@ -631,9 +751,10 @@ def run_mission(cf, shared: SharedState):
         except Exception as e:
             print(f'[mission] occ save failed: {e}')
         for label, path, grid_fn in [
-            ('occ_scan_high', logger.occ_scan_high_path, lambda: shared.occ_scan_high_grid),
-            ('occ_low',       logger.occ_low_path,       lambda: shared.occ_low_grid),
-            ('occ_diff',      logger.occ_diff_path,      lambda: shared.occ_diff_grid),
+            ('occ_scan_high', logger.occ_scan_high_path,  lambda: shared.occ_scan_high_grid),
+            ('occ_low',       logger.occ_low_path,        lambda: shared.occ_low_grid),
+            ('occ_diff',      logger.occ_diff_path,       lambda: shared.occ_diff_grid),
+            ('occ_return',    logger.occ_return_path,     lambda: shared.occ_return_grid),
         ]:
             try:
                 g = grid_fn()

@@ -22,11 +22,13 @@ class FlightLogger:
             'vx_ms', 'vy_ms', 'vz_ms',
             'range_front_m', 'range_back_m', 'range_left_m', 'range_right_m', 'range_up_m',
             'target_x_m', 'target_y_m',
+            'frontier_x_m', 'frontier_y_m',
         ])
         self._t0 = time.time()
         self._row_count = 0
         self._state = ''
         self._target = None
+        self._frontier = None
         print(f'[logger] {self._path}')
 
     @property
@@ -45,6 +47,10 @@ class FlightLogger:
     def occ_diff_path(self) -> str:
         return self._path.replace('.csv', '_occ_diff.npz')
 
+    @property
+    def occ_return_path(self) -> str:
+        return self._path.replace('.csv', '_occ_return.npz')
+
     def set_state(self, state: str):
         self._state = state
 
@@ -53,6 +59,12 @@ class FlightLogger:
 
     def clear_target(self):
         self._target = None
+
+    def set_frontier(self, x, y):
+        self._frontier = (x, y)
+
+    def clear_frontier(self):
+        self._frontier = None
 
     def log(self, x: float, y: float, z_down: Optional[float],
             yaw: float = 0.0, roll: float = 0.0, pitch: float = 0.0,
@@ -63,14 +75,16 @@ class FlightLogger:
             up: Optional[float] = None):
         t = round(time.time() - self._t0, 3)
         def _f(v): return '' if v is None else round(v, 4)
-        tx = '' if self._target is None else round(self._target[0], 4)
-        ty = '' if self._target is None else round(self._target[1], 4)
+        tx = '' if self._target   is None else round(self._target[0],   4)
+        ty = '' if self._target   is None else round(self._target[1],   4)
+        fx = '' if self._frontier is None else round(self._frontier[0], 4)
+        fy = '' if self._frontier is None else round(self._frontier[1], 4)
         self._writer.writerow([
             t, self._state, round(x, 4), round(y, 4), _f(z_down),
             round(yaw, 2), round(roll, 2), round(pitch, 2), round(yaw_ref, 2),
             round(vx, 4), round(vy, 4), round(vz, 4),
             _f(front), _f(back), _f(left), _f(right), _f(up),
-            tx, ty,
+            tx, ty, fx, fy,
         ])
         self._row_count += 1
         if self._row_count % self._FLUSH_EVERY == 0:

@@ -156,6 +156,57 @@ class FrontierNavigator:
 
         return self._occ.cell_to_world(best_row, best_col)
 
+    def find_min_x_target(self, drone_x: float, drone_y: float,
+                          x_limit: Optional[float] = None) -> Optional[Tuple[float, float]]:
+        """Return world (x, y) of the farthest reachable cell in -x, or None."""
+        grid = self._occ.snapshot()
+        rows, cols = grid.shape
+        sr, sc = self._occ.world_to_cell(drone_x, drone_y)
+
+        if not (0 <= sr < rows and 0 <= sc < cols):
+            return None
+
+        limit_col = 0
+        if x_limit is not None:
+            lc = int((x_limit - self._occ.x_min) / self._occ.res)
+            limit_col = max(0, lc)
+
+        visited = np.zeros((rows, cols), dtype=bool)
+        queue = deque([(sr, sc)])
+        visited[sr, sc] = True
+        best_col = sc
+        best_row = sr
+        found = False
+
+        while queue:
+            r, c = queue.popleft()
+
+            if grid[r, c] == FREE and c < sc:
+                if not found or c < best_col or (
+                        c == best_col and
+                        abs(r - rows // 2) < abs(best_row - rows // 2)):
+                    best_col = c
+                    best_row = r
+                    found = True
+
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = r + dr, c + dc
+                    if nc < limit_col:
+                        continue
+                    if (0 <= nr < rows and 0 <= nc < cols and
+                            not visited[nr, nc] and
+                            grid[nr, nc] == FREE):
+                        visited[nr, nc] = True
+                        queue.append((nr, nc))
+
+        if not found:
+            return None
+
+        return self._occ.cell_to_world(best_row, best_col)
+
 
 class LawnmowerNavigator:
     """Generates column-wise (Y-sweep, +X advance) ㄹ-pattern waypoints.

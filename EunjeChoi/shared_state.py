@@ -13,6 +13,7 @@ class SharedState:
         self._occ_scan_high_grid = None       # high-altitude scan map snapshot
         self._occ_low_grid = None             # low-altitude scan map snapshot
         self._occ_diff_grid = None            # diff: low OCCUPIED & high not OCCUPIED
+        self._occ_return_grid = None          # return journey nav map snapshot
         self._height_map_edges = []           # list of EdgeEvent
         self._pad_pairs = []                  # list of (cx, cy) matched pairs
         self._pad_candidates = []             # list of PadCandidate
@@ -20,6 +21,8 @@ class SharedState:
         self._target_pos = None               # current nav target (x, y) or None
         self._landing_target = None           # confirmed landing pad position (x, y) or None
         self._landing_align_pos = None        # X-alignment waypoint for pad landing (x, y) or None
+        self._frontier_target = None          # current frontier BFS target (x, y) or None
+        self._nav_waypoints = []              # current A* waypoint list [(x, y), ...]
         self._start_time = None
 
     # ------------------------------------------------------------------ timer
@@ -124,6 +127,16 @@ class SharedState:
         with self._lock:
             self._occ_diff_grid = v
 
+    @property
+    def occ_return_grid(self):
+        with self._lock:
+            return self._occ_return_grid
+
+    @occ_return_grid.setter
+    def occ_return_grid(self, v):
+        with self._lock:
+            self._occ_return_grid = v
+
     # ------------------------------------------------------- height map
 
     @property
@@ -170,6 +183,28 @@ class SharedState:
     def landing_target(self, v):
         with self._lock:
             self._landing_target = v
+
+    # ------------------------------------------------------- frontier / waypoints
+
+    @property
+    def frontier_target(self):
+        with self._lock:
+            return self._frontier_target
+
+    @frontier_target.setter
+    def frontier_target(self, v):
+        with self._lock:
+            self._frontier_target = v
+
+    @property
+    def nav_waypoints(self):
+        with self._lock:
+            return list(self._nav_waypoints)
+
+    @nav_waypoints.setter
+    def nav_waypoints(self, v):
+        with self._lock:
+            self._nav_waypoints = list(v)
 
     # ------------------------------------------------------- landing align pos
 

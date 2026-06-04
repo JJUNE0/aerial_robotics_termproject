@@ -252,6 +252,14 @@ class SensorHub:
         if self._logger is not None:
             self._logger.clear_target()
 
+    def set_frontier(self, x, y):
+        if self._logger is not None:
+            self._logger.set_frontier(x, y)
+
+    def clear_frontier(self):
+        if self._logger is not None:
+            self._logger.clear_frontier()
+
     def reset_edge_detector(self):
         self._edge_detector.reset()
         # Drain any stale events accumulated before the scan

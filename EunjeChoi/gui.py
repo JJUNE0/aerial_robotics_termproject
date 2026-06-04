@@ -225,6 +225,24 @@ class MissionGUI:
         ax.plot(wx_to_col(0.0), wy_to_row(0.0),
                 'y^', markersize=6, zorder=5, label='Takeoff pad')
 
+        # Frontier target (yellow star)
+        frontier = self._shared.frontier_target
+        if frontier is not None:
+            fx, fy = frontier
+            ax.plot(wx_to_col(fx), wy_to_row(fy),
+                    '*', color='yellow', markersize=14, zorder=8, label='Frontier')
+
+        # A* waypoints (cyan dashed line + dots)
+        waypoints = self._shared.nav_waypoints
+        if waypoints:
+            wc = [wx_to_col(wx) for wx, _ in waypoints]
+            wr = [wy_to_row(wy) for _, wy in waypoints]
+            all_c = [wx_to_col(drone_x)] + wc
+            all_r = [wy_to_row(drone_y)] + wr
+            ax.plot(all_c, all_r, color='cyan', lw=0.9,
+                    linestyle='--', alpha=0.7, zorder=4)
+            ax.scatter(wc, wr, c='cyan', s=12, zorder=5, marker='o')
+
         # Region dividers + labels
         self._draw_region_lines(ax, wx_to_col, wy_to_row)
 

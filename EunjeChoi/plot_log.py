@@ -58,10 +58,11 @@ def load_occ(csv_path: str):
 def load_maps(csv_path: str) -> dict:
     """Load all saved map npz files for this log. Keys: occ, scan_high, occ_low, diff."""
     suffixes = {
-        'occ':       '_occ.npz',
-        'scan_high': '_occ_scan_high.npz',
-        'occ_low':   '_occ_low.npz',
-        'diff':      '_occ_diff.npz',
+        'occ':        '_occ.npz',
+        'scan_high':  '_occ_scan_high.npz',
+        'occ_low':    '_occ_low.npz',
+        'diff':       '_occ_diff.npz',
+        'occ_return': '_occ_return.npz',
     }
     result = {}
     for key, suffix in suffixes.items():
@@ -84,7 +85,8 @@ def load(path: str) -> pd.DataFrame:
                 'vx_ms', 'vy_ms', 'vz_ms',
                 'range_front_m', 'range_back_m',
                 'range_left_m', 'range_right_m', 'range_up_m',
-                'target_x_m', 'target_y_m'):
+                'target_x_m', 'target_y_m',
+                'frontier_x_m', 'frontier_y_m'):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
         else:
@@ -268,12 +270,28 @@ def plot(df: pd.DataFrame, title: str, occ_data=None):
     cb.ax.yaxis.set_tick_params(color='black')
     plt.setp(cb.ax.yaxis.get_ticklabels(), color='black')
 
-    # target positions
+    # Frontier targets (unique positions)
+    frontiers = []
+    if 'frontier_x_m' in df.columns:
+        fdf = df[df['frontier_x_m'] != ''][['frontier_x_m', 'frontier_y_m']].drop_duplicates()
+        if len(fdf):
+            fdf = fdf.apply(pd.to_numeric, errors='coerce').dropna()
+            frontiers = list(zip(
+                fdf['frontier_x_m'] + config.TAKEOFF_PAD_X,
+                fdf['frontier_y_m'] + config.TAKEOFF_PAD_Y,
+            ))
+    if frontiers:
+        fx_arr, fy_arr = zip(*frontiers)
+        ax2.scatter(fx_arr, fy_arr, marker='*', color='yellow', s=100,
+                    edgecolors='#cccc00', linewidths=0.5,
+                    zorder=7, label=f'frontier ({len(frontiers)})')
+
+    # target positions (waypoints)
     if targets:
         tx_arr, ty_arr = zip(*targets)
-        ax2.scatter(tx_arr, ty_arr, marker='*', color='gold', s=80,
-                    edgecolors='orange', linewidths=0.5,
-                    zorder=6, label=f'target ({len(targets)})')
+        ax2.scatter(tx_arr, ty_arr, marker='o', color='#00ccff', s=30,
+                    edgecolors='#0099cc', linewidths=0.5,
+                    zorder=6, label=f'waypoint ({len(targets)})')
 
     # entry/exit markers on XY
     if entries:
@@ -441,9 +459,9 @@ def _draw_map_ax(ax, npz, title: str,
 
 
 def plot_maps(csv_path: str, df: pd.DataFrame, maps: dict, title: str):
-    """Show final-state 2×2 map view matching the mission GUI layout."""
+    """Show final-state 2×3 map view (adds return navigation map)."""
     plt.style.use('dark_background')
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(22, 10))
     fig.patch.set_facecolor('#1a1a1a')
     fig.suptitle(f'Final Map State — {title}', color='white', fontsize=11)
 
@@ -457,14 +475,17 @@ def plot_maps(csv_path: str, df: pd.DataFrame, maps: dict, title: str):
             best = min(pad_clusters, key=lambda c: abs(c['w_m'] - config.PAD_SIZE))
             align_x_col = (best['col_min'] + best['col_max']) / 2.0
 
-    _draw_map_ax(axes[0, 0], maps.get('occ'),       'Navigation Map',              df,
+    _draw_map_ax(axes[0, 0], maps.get('occ'),        'Navigation Map (outward)',    df,
                  align_x_col=align_x_col)
     _draw_map_ax(axes[0, 1], maps.get('scan_high'),  'High-Alt Scan Map (0.30 m)', df,
+                 align_x_col=align_x_col)
+    _draw_map_ax(axes[0, 2], maps.get('occ_return'), 'Navigation Map (return)',     df,
                  align_x_col=align_x_col)
     _draw_map_ax(axes[1, 0], maps.get('occ_low'),    'Low-Alt Scan Map (0.08 m)',  df,
                  align_x_col=align_x_col)
     _draw_map_ax(axes[1, 1], maps.get('diff'),       'Diff Map (elevated objects)', df,
                  is_diff=True, align_x_col=align_x_col)
+    axes[1, 2].set_visible(False)
 
     plt.tight_layout()
 

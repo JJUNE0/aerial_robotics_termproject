@@ -15,36 +15,39 @@ def _passable(grid: np.ndarray, row: int, col: int) -> bool:
             grid[row, col] not in (OCCUPIED, INFLATED))
 
 
-def _passable_los(grid: np.ndarray, row: int, col: int) -> bool:
-    """Thick passability check used only for LOS pruning.
-
-    Checks the cell and its 8 neighbours so that a straight-line shortcut
-    is only accepted when the drone body — not just its centre — clears all
-    inflated zones.  INFLATION_RADIUS already adds DRONE_HALF_DIAGONAL around
-    each obstacle; one extra cell here guards against diagonal corner-cutting.
-    """
-    rows, cols = grid.shape
-    for dr in (-1, 0, 1):
-        for dc in (-1, 0, 1):
-            nr, nc = row + dr, col + dc
-            if 0 <= nr < rows and 0 <= nc < cols:
-                if grid[nr, nc] in (OCCUPIED, INFLATED):
-                    return False
-    return True
-
-
 def astar(grid: np.ndarray,
           start: Tuple[int, int],
           goal: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
-    """A* path on an occupancy grid snapshot. Returns list of (row, col) or None."""
+    """A* on occupancy grid — 8-directional, clearance-weighted cost.
+
+    Diagonal moves (cost √2) reduce staircase patterns so simplify_path
+    collapses them into far fewer waypoints.  Corner-cutting through
+    obstacles is prevented: both cardinal neighbours of a diagonal step
+    must be passable.  Clearance cost biases paths toward open corridors.
+    """
     sr, sc = start
     gr, gc = goal
+    rows, cols = grid.shape
 
     if not _passable(grid, gr, gc):
         return None
 
     def h(r: int, c: int) -> float:
-        return math.hypot(r - gr, c - gc)
+        return abs(r - gr) + abs(c - gc)  # Manhattan
+
+    def clearance_penalty(r: int, c: int) -> float:
+        pen = 0.0
+        rad = config.A_STAR_CLEARANCE_RADIUS
+        w   = config.A_STAR_CLEARANCE_WEIGHT
+        for dr in range(-rad, rad + 1):
+            for dc in range(-rad, rad + 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if (0 <= nr < rows and 0 <= nc < cols and
+                        grid[nr, nc] in (OCCUPIED, INFLATED)):
+                    pen += w / math.sqrt(dr * dr + dc * dc)
+        return pen
 
     open_heap: list = []
     heapq.heappush(open_heap, (h(sr, sc), 0.0, sr, sc))
@@ -64,66 +67,93 @@ def astar(grid: np.ndarray,
             path.reverse()
             return path
 
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                nr, nc = r + dr, c + dc
-                if not _passable(grid, nr, nc):
-                    continue
-                # Block diagonal moves through tight corners: both cardinal
-                # neighbours must also be free so the drone body doesn't clip.
-                if dr != 0 and dc != 0:
-                    if not _passable(grid, r + dr, c) or not _passable(grid, r, c + dc):
-                        continue
-                step = math.sqrt(2) if (dr != 0 and dc != 0) else 1.0
-                ng = g + step
-                if ng < g_score.get((nr, nc), float('inf')):
-                    g_score[(nr, nc)] = ng
-                    came_from[(nr, nc)] = (r, c)
-                    heapq.heappush(open_heap, (ng + h(nr, nc), ng, nr, nc))
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if not _passable(grid, nr, nc):
+                continue
+            ng = g + 1.0 + clearance_penalty(nr, nc)
+            if ng < g_score.get((nr, nc), float('inf')):
+                g_score[(nr, nc)] = ng
+                came_from[(nr, nc)] = (r, c)
+                heapq.heappush(open_heap, (ng + h(nr, nc), ng, nr, nc))
 
+    return None
+
+
+def _segment_clear(grid: np.ndarray, a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+    """Check every cell on the horizontal or vertical line from a to b."""
+    r0, c0 = a
+    r1, c1 = b
+    if r0 == r1:
+        for c in range(min(c0, c1), max(c0, c1) + 1):
+            if not _passable(grid, r0, c):
+                return False
+    else:
+        for r in range(min(r0, r1), max(r0, r1) + 1):
+            if not _passable(grid, r, c1):
+                return False
+    return True
+
+
+def _l_via(grid: np.ndarray,
+           a: Tuple[int, int], b: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+    """Return a via-point for an L-shaped path from a to b, or None if impossible.
+
+    Tries H-then-V and V-then-H.  Returns the via-point, or b itself if a
+    direct (same-row/col) segment is clear.
+    """
+    ra, ca = a
+    rb, cb = b
+    if ra == rb or ca == cb:
+        return b if _segment_clear(grid, a, b) else None
+    via_hv = (ra, cb)   # go horizontal first
+    if _segment_clear(grid, a, via_hv) and _segment_clear(grid, via_hv, b):
+        return via_hv
+    via_vh = (rb, ca)   # go vertical first
+    if _segment_clear(grid, a, via_vh) and _segment_clear(grid, via_vh, b):
+        return via_vh
     return None
 
 
 def simplify_path(path: List[Tuple[int, int]],
                   grid: np.ndarray) -> List[Tuple[int, int]]:
-    """Line-of-sight pruning: remove intermediate waypoints when LOS exists."""
+    """Collinear merge + greedy L-shape skip.
+
+    After collapsing collinear steps, greedily skip from the current
+    anchor to the farthest waypoint reachable via a single L-shaped
+    path (H-then-V or V-then-H).  This turns many small staircase
+    steps into one large L-shaped move whenever the corridor is free.
+    """
     if len(path) <= 2:
         return path
 
-    def los(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
-        r0, c0 = a
-        r1, c1 = b
-        dr = abs(r1 - r0)
-        dc = abs(c1 - c0)
-        sr = 1 if r0 < r1 else -1
-        sc = 1 if c0 < c1 else -1
-        err = dr - dc
-        r, c = r0, c0
-        while (r, c) != (r1, c1):
-            if not _passable_los(grid, r, c):
-                return False
-            e2 = 2 * err
-            if e2 > -dc:
-                err -= dc
-                r += sr
-            if e2 < dr:
-                err += dr
-                c += sc
-        return _passable_los(grid, r1, c1)  # also verify endpoint
-
+    # Step 1: collinear merge
     simplified = [path[0]]
+    for i in range(1, len(path) - 1):
+        d1 = (path[i][0] - path[i-1][0], path[i][1] - path[i-1][1])
+        d2 = (path[i+1][0] - path[i][0],  path[i+1][1] - path[i][1])
+        if d1 != d2:
+            simplified.append(path[i])
+    simplified.append(path[-1])
+    path = simplified
+
+    # Step 2: greedy L-shape skip
+    result = [path[0]]
     i = 0
     while i < len(path) - 1:
+        # Search backwards for the farthest reachable waypoint via L-shape
         j = len(path) - 1
         while j > i + 1:
-            if los(path[i], path[j]):
+            if _l_via(grid, path[i], path[j]) is not None:
                 break
             j -= 1
-        simplified.append(path[j])
+        via = _l_via(grid, path[i], path[j])
+        if via is not None and via != path[j]:
+            result.append(via)
+        result.append(path[j])
         i = j
-    return simplified
+
+    return result
 
 
 class FrontierNavigator:
@@ -142,7 +172,6 @@ class FrontierNavigator:
         if not (0 <= sr < rows and 0 <= sc < cols):
             return None
 
-        # If we have an x limit, compute the column limit
         limit_col = cols - 1
         if x_limit is not None:
             lc = int((x_limit - self._occ.x_min) / self._occ.res)
@@ -158,7 +187,6 @@ class FrontierNavigator:
         while queue:
             r, c = queue.popleft()
 
-            # Only FREE cells count as valid destinations
             if grid[r, c] == FREE and c > sc:
                 if not found or c > best_col or (
                         c == best_col and
@@ -174,11 +202,60 @@ class FrontierNavigator:
                     nr, nc = r + dr, c + dc
                     if nc > limit_col:
                         continue
-                    # Traverse FREE and UNKNOWN — UNKNOWN gaps should not block
-                    # exploration toward confirmed-FREE cells ahead
                     if (0 <= nr < rows and 0 <= nc < cols and
                             not visited[nr, nc] and
-                            grid[nr, nc] not in (OCCUPIED, INFLATED)):
+                            grid[nr, nc] == FREE):
+                        visited[nr, nc] = True
+                        queue.append((nr, nc))
+
+        if not found:
+            return None
+
+        return self._occ.cell_to_world(best_row, best_col)
+
+    def find_min_x_target(self, drone_x: float, drone_y: float,
+                          x_limit: Optional[float] = None) -> Optional[Tuple[float, float]]:
+        """Return world (x, y) of the farthest reachable cell in -x, or None."""
+        grid = self._occ.snapshot()
+        rows, cols = grid.shape
+        sr, sc = self._occ.world_to_cell(drone_x, drone_y)
+
+        if not (0 <= sr < rows and 0 <= sc < cols):
+            return None
+
+        limit_col = 0
+        if x_limit is not None:
+            lc = int((x_limit - self._occ.x_min) / self._occ.res)
+            limit_col = max(0, lc)
+
+        visited = np.zeros((rows, cols), dtype=bool)
+        queue = deque([(sr, sc)])
+        visited[sr, sc] = True
+        best_col = sc
+        best_row = sr
+        found = False
+
+        while queue:
+            r, c = queue.popleft()
+
+            if grid[r, c] == FREE and c < sc:
+                if not found or c < best_col or (
+                        c == best_col and
+                        abs(r - rows // 2) < abs(best_row - rows // 2)):
+                    best_col = c
+                    best_row = r
+                    found = True
+
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = r + dr, c + dc
+                    if nc < limit_col:
+                        continue
+                    if (0 <= nr < rows and 0 <= nc < cols and
+                            not visited[nr, nc] and
+                            grid[nr, nc] == FREE):
                         visited[nr, nc] = True
                         queue.append((nr, nc))
 

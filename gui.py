@@ -5,12 +5,13 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
 from matplotlib.animation import FuncAnimation
+from matplotlib.ticker import MultipleLocator
 from matplotlib.widgets import Button
 
 import numpy as np
 
 import config
-from mapping import FREE, UNKNOWN, OCCUPIED, INFLATED
+from mapping import FREE, UNKNOWN, OCCUPIED, INFLATED, compute_diff_clusters
 from shared_state import SharedState
 
 _CELL_RGB = {
@@ -28,13 +29,13 @@ class MissionGUI:
     def start(self):
         """Build the figure and block on plt.show() — call from main thread."""
         plt.style.use('dark_background')
-        fig = plt.figure(figsize=(14, 8))
+        fig = plt.figure(figsize=(16, 10))
         fig.patch.set_facecolor('#1a1a1a')
         self._fig = fig
 
-        gs = gridspec.GridSpec(3, 2, figure=fig,
-                               height_ratios=[0.10, 0.82, 0.08],
-                               hspace=0.35, wspace=0.3)
+        gs = gridspec.GridSpec(4, 2, figure=fig,
+                               height_ratios=[0.08, 0.43, 0.43, 0.06],
+                               hspace=0.40, wspace=0.3)
 
         # ---- status bar (top row, spans both columns)
         ax_status = fig.add_subplot(gs[0, :])
@@ -46,16 +47,24 @@ class MissionGUI:
             fontfamily='monospace',
         )
 
-        # ---- occupancy map (left)
+        # ---- occupancy map (nav, top-left)
         self._ax_occ = fig.add_subplot(gs[1, 0])
-        self._ax_occ.set_title('Occupancy Map', color='white', fontsize=10)
+        self._ax_occ.set_title('Navigation Map', color='white', fontsize=10)
 
-        # ---- height map / edge scatter (right)
-        self._ax_hm = fig.add_subplot(gs[1, 1])
-        self._ax_hm.set_title('Edge Map & Pad Candidates', color='white', fontsize=10)
+        # ---- high-altitude scan map (top-right)
+        self._ax_scan_high = fig.add_subplot(gs[1, 1])
+        self._ax_scan_high.set_title('High-Alt Scan Map (0.30 m)', color='white', fontsize=10)
+
+        # ---- low-altitude scan map (bottom-left)
+        self._ax_hm = fig.add_subplot(gs[2, 0])
+        self._ax_hm.set_title('Low-Alt Scan Map (0.08 m)', color='white', fontsize=10)
+
+        # ---- diff map (bottom-right)
+        self._ax_diff = fig.add_subplot(gs[2, 1])
+        self._ax_diff.set_title('Diff Map (elevated objects)', color='white', fontsize=10)
 
         # ---- emergency button (bottom row)
-        btn_axes = plt.axes([0.38, 0.01, 0.24, 0.055])
+        btn_axes = plt.axes([0.38, 0.01, 0.24, 0.045])
         self._btn = Button(btn_axes, 'EMERGENCY LAND',
                            color='#aa0000', hovercolor='#ff2222')
         self._btn.label.set_color('white')
@@ -89,9 +98,45 @@ class MissionGUI:
         )
 
         self._draw_occupancy(x, y, shared.landing_target)
-        self._draw_edges(shared)
+        self._draw_scan_map(self._ax_scan_high, shared.occ_scan_high_grid,
+                            'High-Alt Scan Map (0.30 m)', shared)
+        self._draw_scan_map(self._ax_hm, shared.occ_low_grid,
+                            'Low-Alt Scan Map (0.08 m)', shared)
+        self._draw_diff(shared)
 
         return []
+
+    # ---------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _setup_map_grid(ax):
+        """Add 10 cm minor grid lines to a map axes."""
+        step = 0.1 / config.OCCUPANCY_GRID_RES
+        ax.xaxis.set_minor_locator(MultipleLocator(step))
+        ax.yaxis.set_minor_locator(MultipleLocator(step))
+        ax.grid(True, which='minor', color='#2e2e2e', linewidth=0.3, zorder=2)
+        ax.grid(True, which='major', color='#444444', linewidth=0.5, zorder=2)
+
+    def _draw_region_lines(self, ax, wx_to_col, wy_to_row):
+        """Draw start/middle/landing region dividers with labels on any map axes."""
+        x1 = config.START_REGION_X - config.TAKEOFF_PAD_X
+        x2 = config.START_REGION_X + config.MIDDLE_REGION_X - config.TAKEOFF_PAD_X
+        y_top = config.ekf_arena_y_max()
+
+        for xv in (x1, x2):
+            ax.axvline(wx_to_col(xv), color='yellow', linewidth=0.8,
+                       linestyle='--', alpha=0.7, zorder=4)
+
+        # Region label centres (arena x midpoints → EKF)
+        regions = [
+            ((config.ekf_arena_x_min() + x1) / 2, 'START'),
+            ((x1 + x2) / 2,                        'MIDDLE'),
+            ((x2 + config.ekf_arena_x_max()) / 2,  'LANDING'),
+        ]
+        for rx, label in regions:
+            ax.text(wx_to_col(rx), wy_to_row(y_top) - 2,
+                    label, color='yellow', fontsize=6,
+                    ha='center', va='top', alpha=0.85, zorder=5)
 
     # ---------------------------------------------------------------- occupancy
 
@@ -146,6 +191,7 @@ class MissionGUI:
         ax.set_yticklabels([str(i) for i in range(int(config.ARENA_Y) + 1)],
                            fontsize=7)
         ax.set_ylabel('y (m)', color='white', fontsize=8)
+        self._setup_map_grid(ax)
 
         # Drone marker (EKF pos → same col/row mapping)
         ax.plot(wx_to_col(drone_x), wy_to_row(drone_y),
@@ -179,11 +225,26 @@ class MissionGUI:
         ax.plot(wx_to_col(0.0), wy_to_row(0.0),
                 'y^', markersize=6, zorder=5, label='Takeoff pad')
 
-        # Region dividers
-        for region_x in [config.START_REGION_X - config.TAKEOFF_PAD_X,
-                          config.START_REGION_X + config.MIDDLE_REGION_X - config.TAKEOFF_PAD_X]:
-            ax.axvline(wx_to_col(region_x), color='yellow', linewidth=0.8,
-                       linestyle='--', alpha=0.6)
+        # Frontier target (yellow star)
+        frontier = self._shared.frontier_target
+        if frontier is not None:
+            fx, fy = frontier
+            ax.plot(wx_to_col(fx), wy_to_row(fy),
+                    '*', color='yellow', markersize=14, zorder=8, label='Frontier')
+
+        # A* waypoints (cyan dashed line + dots)
+        waypoints = self._shared.nav_waypoints
+        if waypoints:
+            wc = [wx_to_col(wx) for wx, _ in waypoints]
+            wr = [wy_to_row(wy) for _, wy in waypoints]
+            all_c = [wx_to_col(drone_x)] + wc
+            all_r = [wy_to_row(drone_y)] + wr
+            ax.plot(all_c, all_r, color='cyan', lw=0.9,
+                    linestyle='--', alpha=0.7, zorder=4)
+            ax.scatter(wc, wr, c='cyan', s=12, zorder=5, marker='o')
+
+        # Region dividers + labels
+        self._draw_region_lines(ax, wx_to_col, wy_to_row)
 
         # Legend patches
         patches = [
@@ -195,80 +256,176 @@ class MissionGUI:
         ax.legend(handles=patches, loc='upper right', fontsize=6,
                   facecolor='#333333', labelcolor='white', framealpha=0.8)
 
-    # ---------------------------------------------------------------- edges
+    # ---------------------------------------------------------------- scan maps
 
-    def _draw_edges(self, shared: SharedState):
-        ax = self._ax_hm
+    def _draw_scan_map(self, ax, grid, title: str, shared: SharedState):
         ax.clear()
-        ax.set_title('Edge Map & Pad Candidates', color='white', fontsize=10)
+        ax.set_title(title, color='white', fontsize=10)
         ax.set_facecolor('#1a1a1a')
         ax.tick_params(colors='white')
 
-        if config.TAKEOFF_PAD_X is None:
+        if grid is None:
+            ax.text(0.5, 0.5, 'Not yet available',
+                    transform=ax.transAxes, color='#888888',
+                    fontsize=10, ha='center', va='center')
             return
 
-        px, py = config.TAKEOFF_PAD_X, config.TAKEOFF_PAD_Y
-        drone_x, drone_y, _, _ = shared.pose
+        rows, cols = grid.shape
+        img = np.zeros((rows, cols, 3), dtype=float)
+        for val, rgb in _CELL_RGB.items():
+            img[grid == val] = rgb
+        ax.imshow(img, origin='lower', aspect='equal', interpolation='nearest')
 
-        edges = shared.height_map_edges
-        pairs = shared.pad_pairs
-        candidates = shared.pad_candidates
+        res = config.OCCUPANCY_GRID_RES
+        x_min = config.ekf_arena_x_min() - 0.5
+        y_min = config.ekf_arena_y_min() - 0.5
 
-        # Edge events (EKF → arena coords)
-        if edges:
-            ex = [e.x + px for e in edges if e.kind == 'entry']
-            ey = [e.y + py for e in edges if e.kind == 'entry']
-            ox = [e.x + px for e in edges if e.kind == 'exit']
-            oy = [e.y + py for e in edges if e.kind == 'exit']
-            if ex:
-                ax.scatter(ex, ey, c='#ff4444', s=12, label='Entry', zorder=3)
-            if ox:
-                ax.scatter(ox, oy, c='#4444ff', s=12, label='Exit', zorder=3)
+        def wx_to_col(wx): return (wx - x_min) / res
+        def wy_to_row(wy): return (wy - y_min) / res
 
-        # Matched entry-exit pairs: line from entry → exit + midpoint dot
-        for i, (cx, cy, enx, eny, exx, exy) in enumerate(pairs):
-            lbl = f'Pair ({len(pairs)})' if i == 0 else ''
-            ax.plot([enx + px, exx + px], [eny + py, exy + py],
-                    color='#ffaa00', lw=1.2, zorder=4, label=lbl)
-
-        # Landing target (arena coords) — must be read before the candidate block
-        landing_target = shared.landing_target
-
-        # Pad candidates — hidden once landing target is confirmed
-        if landing_target is None:
-            for cand in candidates:
-                cx_a, cy_a = cand.cx + px, cand.cy + py
-                ax.plot(cx_a, cy_a, 'g*', markersize=16, zorder=5,
-                        label='Pad candidate')
-                ax.add_patch(plt.Circle((cx_a, cy_a), config.PAD_SIZE / 2,
-                                        color='lime', fill=False,
-                                        linewidth=1.2, zorder=4))
-        if landing_target is not None:
-            lx, ly = landing_target[0] + px, landing_target[1] + py
-            ax.plot(lx, ly, 'D', color='#ff8800', markersize=10, zorder=7,
-                    label='Landing target')
-            ax.add_patch(plt.Circle((lx, ly), config.PAD_SIZE / 2,
-                                    color='#ff8800', fill=False,
-                                    linewidth=1.5, zorder=6))
-
-        # Drone marker
-        ax.plot(drone_x + px, drone_y + py,
-                'co', markersize=7, zorder=5, label='Drone')
-
-        # Landing region only
-        land_x0 = config.START_REGION_X + config.MIDDLE_REGION_X
-        ax.set_xlim(land_x0 - 0.1, config.ARENA_X + 0.1)
-        ax.set_ylim(-0.1, config.ARENA_Y + 0.1)
-        x_ticks = [x for x in range(int(land_x0), int(config.ARENA_X) + 1)]
-        ax.set_xticks(x_ticks)
-        ax.set_xticklabels([str(x) for x in x_ticks], fontsize=7)
-        ax.set_yticks(range(int(config.ARENA_Y) + 1))
-        ax.set_yticklabels([str(y) for y in range(int(config.ARENA_Y) + 1)],
+        ax.set_xlim(wx_to_col(config.ekf_arena_x_min()),
+                    wx_to_col(config.ekf_arena_x_max()))
+        ax.set_ylim(wy_to_row(config.ekf_arena_y_min()),
+                    wy_to_row(config.ekf_arena_y_max()))
+        ax.set_xticks([wx_to_col(i - config.TAKEOFF_PAD_X)
+                       for i in range(int(config.ARENA_X) + 1)])
+        ax.set_xticklabels([str(i) for i in range(int(config.ARENA_X) + 1)],
+                           fontsize=7)
+        ax.set_yticks([wy_to_row(i - config.TAKEOFF_PAD_Y)
+                       for i in range(int(config.ARENA_Y) + 1)])
+        ax.set_yticklabels([str(i) for i in range(int(config.ARENA_Y) + 1)],
                            fontsize=7)
         ax.set_xlabel('x (m)', color='white', fontsize=8)
         ax.set_ylabel('y (m)', color='white', fontsize=8)
-        ax.set_aspect('equal', adjustable='box')
+        self._setup_map_grid(ax)
 
-        if edges or candidates or landing_target is not None:
-            ax.legend(loc='upper right', fontsize=6,
-                      facecolor='#333333', labelcolor='white', framealpha=0.8)
+        self._draw_region_lines(ax, wx_to_col, wy_to_row)
+
+        drone_x, drone_y, _, _ = shared.pose
+        ax.plot(wx_to_col(drone_x), wy_to_row(drone_y),
+                'co', markersize=6, zorder=5)
+
+        landing_target = shared.landing_target
+        if landing_target is not None:
+            lx, ly = landing_target
+            ax.plot(wx_to_col(lx), wy_to_row(ly),
+                    'D', color='#ff8800', markersize=8, zorder=7)
+            ax.add_patch(plt.Circle(
+                (wx_to_col(lx), wy_to_row(ly)),
+                config.PAD_SIZE / 2 / res,
+                color='#ff8800', fill=False, linewidth=1.5, zorder=6))
+
+        align_pos = shared.landing_align_pos
+        if align_pos is not None:
+            ax.axvline(wx_to_col(align_pos[0]), color='#00ccff',
+                       linewidth=1.2, linestyle='--', alpha=0.85, zorder=8)
+
+        patches = [
+            mpatches.Patch(color='white',   label='Free'),
+            mpatches.Patch(color='#b3b3b3', label='Unknown'),
+            mpatches.Patch(color='#1a1a1a', label='Occupied'),
+            mpatches.Patch(color='#737373', label='Inflated'),
+        ]
+        ax.legend(handles=patches, loc='upper right', fontsize=6,
+                  facecolor='#333333', labelcolor='white', framealpha=0.8)
+
+    # ---------------------------------------------------------------- diff map
+
+    def _draw_diff(self, shared: SharedState):
+        ax = self._ax_diff
+        ax.clear()
+        ax.set_title('Diff Map (elevated objects)', color='white', fontsize=10)
+        ax.set_facecolor('#1a1a1a')
+        ax.tick_params(colors='white')
+
+        diff = shared.occ_diff_grid
+        if diff is None:
+            ax.text(0.5, 0.5, 'Not yet available',
+                    transform=ax.transAxes, color='#888888',
+                    fontsize=10, ha='center', va='center')
+            return
+
+        rows, cols = diff.shape
+        # White = elevated object (diff=1), dark = background (diff=0)
+        img = np.zeros((rows, cols, 3), dtype=float)
+        img[diff == 0] = [0.15, 0.15, 0.15]
+        img[diff == 1] = [1.0,  0.6,  0.1]   # orange = elevated cell
+
+        ax.imshow(img, origin='lower', aspect='equal', interpolation='nearest')
+
+        res = config.OCCUPANCY_GRID_RES
+        x_min = config.ekf_arena_x_min() - 0.5
+        y_min = config.ekf_arena_y_min() - 0.5
+
+        def wx_to_col(wx): return (wx - x_min) / res
+        def wy_to_row(wy): return (wy - y_min) / res
+
+        ax.set_xlim(wx_to_col(config.ekf_arena_x_min()),
+                    wx_to_col(config.ekf_arena_x_max()))
+        ax.set_ylim(wy_to_row(config.ekf_arena_y_min()),
+                    wy_to_row(config.ekf_arena_y_max()))
+        ax.set_xticks([wx_to_col(i - config.TAKEOFF_PAD_X)
+                       for i in range(int(config.ARENA_X) + 1)])
+        ax.set_xticklabels([str(i) for i in range(int(config.ARENA_X) + 1)],
+                           fontsize=7)
+        ax.set_yticks([wy_to_row(i - config.TAKEOFF_PAD_Y)
+                       for i in range(int(config.ARENA_Y) + 1)])
+        ax.set_yticklabels([str(i) for i in range(int(config.ARENA_Y) + 1)],
+                           fontsize=7)
+        ax.set_xlabel('x (m)', color='white', fontsize=8)
+        ax.set_ylabel('y (m)', color='white', fontsize=8)
+        self._setup_map_grid(ax)
+
+        self._draw_region_lines(ax, wx_to_col, wy_to_row)
+
+        drone_x, drone_y, _, _ = shared.pose
+        ax.plot(wx_to_col(drone_x), wy_to_row(drone_y),
+                'co', markersize=6, zorder=5)
+
+        landing_target = shared.landing_target
+        if landing_target is not None:
+            lx, ly = landing_target
+            ax.plot(wx_to_col(lx), wy_to_row(ly),
+                    'D', color='#ff8800', markersize=8, zorder=7)
+            ax.add_patch(plt.Circle(
+                (wx_to_col(lx), wy_to_row(ly)),
+                config.PAD_SIZE / 2 / res,
+                color='#ff8800', fill=False, linewidth=1.5, zorder=6))
+
+        align_pos = shared.landing_align_pos
+        if align_pos is not None:
+            ax.axvline(wx_to_col(align_pos[0]), color='#00ccff',
+                       linewidth=1.2, linestyle='--', alpha=0.85,
+                       zorder=8, label='X-align')
+
+        # Cluster bounding boxes
+        clusters = compute_diff_clusters(diff, res)
+        first_pad = True
+        first_rej = True
+        for cl in clusters:
+            color = '#00ff88' if cl['is_pad'] else '#ff4444'
+            lbl = None
+            if cl['is_pad'] and first_pad:
+                lbl = 'Pad cand.'
+                first_pad = False
+            elif not cl['is_pad'] and first_rej:
+                lbl = 'Rejected'
+                first_rej = False
+            ax.add_patch(mpatches.Rectangle(
+                (cl['col_min'], cl['row_min']),
+                cl['col_max'] - cl['col_min'],
+                cl['row_max'] - cl['row_min'],
+                linewidth=1.5, edgecolor=color,
+                facecolor='none', zorder=8, label=lbl))
+            ax.text(cl['col_min'], cl['row_max'] + 1,
+                    f'X={cl["w_m"]*100:.0f} Y={cl["h_m"]*100:.0f}cm',
+                    color=color, fontsize=5.5, zorder=9, va='bottom')
+
+        patches = [
+            mpatches.Patch(color='#ff9900', label='Elevated (pad/bar)'),
+            mpatches.Patch(color='#262626', label='Background'),
+            mpatches.Patch(color='#00ff88', fill=False, label='Pad cand.'),
+            mpatches.Patch(color='#ff4444', fill=False, label='Rejected'),
+        ]
+        ax.legend(handles=patches, loc='upper right', fontsize=6,
+                  facecolor='#333333', labelcolor='white', framealpha=0.8)

@@ -1,11 +1,12 @@
 """
-Simple back-and-forth test flight.
+Simple back-and-forth test flight using velocity control.
 Takeoff → hover → move +X → return → land.
 
 Usage:
     python test_hover.py
 """
 
+import math
 import time
 
 import cflib.crtp
@@ -17,46 +18,63 @@ import controller
 from logger import FlightLogger
 from sensors import SensorHub
 
-FORWARD_DIST = 0.45 * 3   # m to travel in +X
-SPEED        = 0.1   # m/s
-HOVER_TIME   = 1     # s pause at each end
-ENTRY_DECEL  = 1.0   # s to decelerate to a stop on entry
-ENTRY_HOVER  = 0.5   # s to hover after stopping
+FORWARD_DIST = 0.45 * 2  # m to travel in +X
+SPEED        = 0.1        # m/s
+HOVER_TIME   = 1.0        # s pause at each end
+PAUSE        = config.EDGE_COOLDOWN   # hover on entry/exit (= detection cooldown)
+KP           = 3.0        # position P-gain
 
 
-def _travel(hlc, hub, tx, ty, speed, label='move'):
-    """go_to (tx, ty) at speed, pausing on every entry event."""
-    pose = hub.read().pose
-    dist = ((tx - pose[0]) ** 2 + (ty - pose[1]) ** 2) ** 0.5
-    duration = max(dist / speed, 0.5)
-    print(f'[test] {label} → ({tx:.3f}, {ty:.3f})  {duration:.1f}s')
-    hlc.go_to(tx, ty, config.FLIGHT_Z, 0.0, duration)
+def _travel(cf, hub, tx, ty, speed, label='move'):
+    """Velocity P-controller to (tx, ty), pausing on entry/exit events."""
+    print(f'[test] {label} → ({tx:.3f}, {ty:.3f})')
 
-    deadline = time.time() + duration
-    while time.time() < deadline:
+    while True:
+        pose = hub.read().pose
+        cx, cy, _, cyaw = pose
+        dx, dy = tx - cx, ty - cy
+        dist = math.hypot(dx, dy)
+
+        if dist < config.NAV_ARRIVE_THRESHOLD:
+            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+            return
+
+        # Check edge events
         try:
             event = hub.edge_queue.get_nowait()
-            if event.kind == 'entry':
-                data = hub.read()
-                px, py = data.pose[0], data.pose[1]
-                vx, vy = data.velocity[0], data.velocity[1]
-                # Aim for the natural stopping point (v·t/2 under constant decel)
-                stop_x = px + vx * ENTRY_DECEL * 0.5
-                stop_y = py + vy * ENTRY_DECEL * 0.5
-                print(f'[test] entry at ({event.x:.3f}, {event.y:.3f}) '
-                      f'vel=({vx:.3f},{vy:.3f}) '
-                      f'→ stop ({stop_x:.3f}, {stop_y:.3f})')
-                hlc.go_to(stop_x, stop_y, config.FLIGHT_Z, 0.0, ENTRY_DECEL)
-                time.sleep(ENTRY_DECEL + ENTRY_HOVER)
-                remaining = max(deadline - time.time(), 0.5)
-                hlc.go_to(tx, ty, config.FLIGHT_Z, 0.0, remaining)
+            if event.kind in ('entry', 'exit'):
+                vel = hub.read().velocity
+                vx, vy = vel[0], vel[1]
+                stop_x = cx + vx * PAUSE * 0.5
+                stop_y = cy + vy * PAUSE * 0.5
+                print(f'[test] {event.kind} at ({event.x:.3f}, {event.y:.3f}) '
+                      f'vel=({vx:.3f},{vy:.3f}) → stop ({stop_x:.3f}, {stop_y:.3f})')
+                # Hover at predicted stop position
+                end_t = time.time() + PAUSE
+                while time.time() < end_t:
+                    sx = stop_x - cx
+                    sy = stop_y - cy
+                    sd = math.hypot(sx, sy)
+                    if sd > 0.02:
+                        sv = min(speed, sd * KP)
+                        vxb, vyb = controller.vel_to_body(
+                            (sx/sd)*sv, (sy/sd)*sv, cyaw)
+                        cf.commander.send_hover_setpoint(vxb, vyb, 0, config.FLIGHT_Z)
+                    else:
+                        cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+                    time.sleep(config.DT)
+                    pose = hub.read().pose
+                    cx, cy, _, cyaw = pose
         except Exception:
             pass
+
+        v = min(speed, dist * KP)
+        vx_b, vy_b = controller.vel_to_body((dx/dist)*v, (dy/dist)*v, cyaw)
+        cf.commander.send_hover_setpoint(vx_b, vy_b, 0, config.FLIGHT_Z)
         time.sleep(config.DT)
 
 
 def run(cf):
-    hlc = cf.high_level_commander
     logger = FlightLogger()
     hub = SensorHub(cf, logger=logger)
 
@@ -65,30 +83,30 @@ def run(cf):
 
     try:
         print('[test] takeoff')
-        hlc.takeoff(0.5, 1.0)    # punch through ground effect fast (cfclient style)
-        time.sleep(1.5)
-        hlc.go_to(0.0, 0.0, config.FLIGHT_Z, 0.0, 1.0)   # descend to cruise altitude
-        time.sleep(2.0)
+        controller.takeoff_vel(cf, config.FLIGHT_Z)
 
-        # Record stabilised hover position as home — EKF may have drifted during takeoff
         pose = hub.read().pose
         home_x, home_y = pose[0], pose[1]
         print(f'[test] home recorded: ({home_x:.3f}, {home_y:.3f})')
 
-        _travel(hlc, hub, home_x + FORWARD_DIST, home_y, SPEED, 'move forward')
-        time.sleep(HOVER_TIME)
+        _travel(cf, hub, home_x + FORWARD_DIST, home_y, SPEED, 'move forward')
+        end_t = time.time() + HOVER_TIME
+        while time.time() < end_t:
+            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+            time.sleep(config.DT)
 
-        _travel(hlc, hub, home_x, home_y, SPEED, 'return home')
-        time.sleep(HOVER_TIME)
+        _travel(cf, hub, home_x, home_y, SPEED, 'return home')
+        end_t = time.time() + HOVER_TIME
+        while time.time() < end_t:
+            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+            time.sleep(config.DT)
 
         print('[test] land')
-        hlc.land(0.0, 2.0)
-        time.sleep(2.5)
+        controller.land_vel(cf, hub)
 
     except KeyboardInterrupt:
         print('[test] interrupted — emergency land')
-        hlc.land(0.0, 2.0)
-        time.sleep(2.5)
+        controller.land_vel(cf, hub)
 
     finally:
         hub.stop()

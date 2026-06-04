@@ -232,16 +232,18 @@ class MissionGUI:
             ax.plot(wx_to_col(fx), wy_to_row(fy),
                     '*', color='yellow', markersize=14, zorder=8, label='Frontier')
 
-        # A* waypoints (cyan dashed line + dots)
+        # A* waypoints — cyan for outward, orange for return
         waypoints = self._shared.nav_waypoints
         if waypoints:
+            ret_states = {'RET_WAYPOINT', 'NAV_TO_START'}
+            wp_color = '#ff8c00' if self._shared.current_state in ret_states else 'cyan'
             wc = [wx_to_col(wx) for wx, _ in waypoints]
             wr = [wy_to_row(wy) for _, wy in waypoints]
             all_c = [wx_to_col(drone_x)] + wc
             all_r = [wy_to_row(drone_y)] + wr
-            ax.plot(all_c, all_r, color='cyan', lw=0.9,
+            ax.plot(all_c, all_r, color=wp_color, lw=0.9,
                     linestyle='--', alpha=0.7, zorder=4)
-            ax.scatter(wc, wr, c='cyan', s=12, zorder=5, marker='o')
+            ax.scatter(wc, wr, c=wp_color, s=12, zorder=5, marker='o')
 
         # Region dividers + labels
         self._draw_region_lines(ax, wx_to_col, wy_to_row)

@@ -479,7 +479,11 @@ def do_pad_confirm(cf, shared, hub, occ, hmap) -> Optional[Tuple[float, float]]:
     return None
 
 
-def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
+def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float,
+                   yaw_align: bool = True,
+                   entry_overshoot: float = None):
+    if entry_overshoot is None:
+        entry_overshoot = config.PAD_LAND_ENTRY_OVERSHOOT
     shared.current_state = 'LANDING_ON_PAD'
 
     # Step 1: align X with cluster centre, keeping current Y
@@ -529,11 +533,11 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
             shared.add_height_map_edge(ev)
             if ev.kind == 'entry' and entry_pos is None:
                 entry_pos = (ev.x, ev.y)
-                entry_target_y = ev.y + approach_dy * config.PAD_LAND_ENTRY_OVERSHOOT
+                entry_target_y = ev.y + approach_dy * entry_overshoot
                 shared.target_pos = (pad_x, entry_target_y)
                 shared.current_state = 'LAND_ENTRY'
                 print(f'[land] edge entry at ({ev.x:.3f}, {ev.y:.3f}),'
-                      f' target +{config.PAD_LAND_ENTRY_OVERSHOOT:.2f} m'
+                      f' target +{entry_overshoot:.2f} m'
                       f' -> ({pad_x:.3f}, {entry_target_y:.3f})')
             elif entry_pos is not None and second_edge_pos is None:
                 second_edge_pos = (ev.x, ev.y)
@@ -546,7 +550,7 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
 
         if entry_pos is not None:
             pushed_dist = approach_dy * (cy - entry_pos[1])
-            if pushed_dist >= config.PAD_LAND_ENTRY_OVERSHOOT:
+            if pushed_dist >= entry_overshoot:
                 land_reason = 'distance'
                 break
         else:
@@ -575,32 +579,32 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
     time.sleep(1.0)
 
-    # Rotate to face back toward start (-179.9° = just below ±180 boundary)
-    land_yaw = -179.9
-    shared.current_state = 'LAND_YAW_ALIGN'
-    data = _step(shared, hub, occ, hmap)
-    current_yaw = data.pose[3]
-    hold_x, hold_y = data.pose[0], data.pose[1]
-    delta = ((land_yaw - current_yaw) + 180.0) % 360.0 - 180.0
-    print(f'[land] yaw align: target={land_yaw:.1f}°  current={current_yaw:.1f}°  delta={delta:+.1f}°')
-    if abs(delta) > 1.0:
-        hold_kp = 2.0
-        max_xy  = 0.10
-        timeout = time.time() + abs(delta) / config.SCAN_ROTATE_RATE * 4.0
-        while time.time() < timeout:
-            data = _step(shared, hub, occ, hmap)
-            cx, cy, _, cyaw = data.pose
-            delta = ((land_yaw - cyaw) + 180.0) % 360.0 - 180.0
-            if abs(delta) < 1.0:
-                break
-            yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, delta)
-            vx_w = max(-max_xy, min(max_xy, (hold_x - cx) * hold_kp))
-            vy_w = max(-max_xy, min(max_xy, (hold_y - cy) * hold_kp))
-            vx_b, vy_b = controller.vel_to_body(vx_w, vy_w, cyaw)
-            cf.commander.send_hover_setpoint(vx_b, vy_b, yaw_rate, config.FLIGHT_Z)
-            time.sleep(config.DT)
-        cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
-        time.sleep(0.5)
+    if yaw_align:
+        land_yaw = shared.home_yaw
+        shared.current_state = 'LAND_YAW_ALIGN'
+        data = _step(shared, hub, occ, hmap)
+        current_yaw = data.pose[3]
+        hold_x, hold_y = data.pose[0], data.pose[1]
+        delta = ((land_yaw - current_yaw) + 180.0) % 360.0 - 180.0
+        print(f'[land] yaw align: target={land_yaw:.1f}°  current={current_yaw:.1f}°  delta={delta:+.1f}°')
+        if abs(delta) > 1.0:
+            hold_kp = 2.0
+            max_xy  = 0.10
+            timeout = time.time() + abs(delta) / config.SCAN_ROTATE_RATE * 4.0
+            while time.time() < timeout:
+                data = _step(shared, hub, occ, hmap)
+                cx, cy, _, cyaw = data.pose
+                delta = ((land_yaw - cyaw) + 180.0) % 360.0 - 180.0
+                if abs(delta) < 1.0:
+                    break
+                yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, delta)
+                vx_w = max(-max_xy, min(max_xy, (hold_x - cx) * hold_kp))
+                vy_w = max(-max_xy, min(max_xy, (hold_y - cy) * hold_kp))
+                vx_b, vy_b = controller.vel_to_body(vx_w, vy_w, cyaw)
+                cf.commander.send_hover_setpoint(vx_b, vy_b, yaw_rate, config.FLIGHT_Z)
+                time.sleep(config.DT)
+            cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+            time.sleep(0.5)
 
     shared.target_pos = None
     controller.land_vel(cf, hub)
@@ -608,11 +612,17 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
 
 def do_takeoff_from_pad(cf, shared, hub, occ, hmap):
     shared.current_state = 'TAKEOFF_FROM_PAD'
-    # Re-arm after landing on pad (no EKF reset — preserve yaw estimate)
-    for _ in range(20):
+    # Wait for firmware to allow re-arm after landing
+    time.sleep(1.0)
+    armed = False
+    for i in range(50):   # up to 5 s
         if cf.supervisor.can_be_armed:
+            armed = True
+            print(f'[takeoff_pad] can_be_armed=True (attempt {i+1})')
             break
         time.sleep(0.1)
+    if not armed:
+        print('[takeoff_pad] WARNING: can_be_armed never True — attempting anyway')
     cf.supervisor.send_arming_request(True)
     time.sleep(0.5)
     controller.takeoff_vel(cf, config.FLIGHT_Z)
@@ -759,20 +769,57 @@ def _nav_to_home(cf, shared, hub, occ_return: OccupancyGrid, hmap, home_x: float
 def do_nav_to_start(cf, shared, hub, _occ, hmap):
     shared.current_state = 'NAV_TO_START'
     occ_return = OccupancyGrid()
-    # Initial rotation scan to seed the return map
     do_rotation_scan(cf, shared, hub, occ_return, hmap)
-    home_x = 1.0 - config.TAKEOFF_PAD_X   # arena X=1.0 → EKF X=0.0
+    home_x = config.RETURN_SCAN_X - config.TAKEOFF_PAD_X   # arena X=0.5 → EKF -0.5
     _nav_to_home(cf, shared, hub, occ_return, hmap, home_x)
     shared.current_state = 'NAV_TO_START'
     shared.occ_return_grid = occ_return.snapshot()
 
 
+def do_return_region_scan(cf, shared, hub, occ, hmap):
+    """Two-pass dual-altitude scan to locate the takeoff pad on return."""
+    shared.current_state = 'RETURN_REGION_SCAN'
+
+    sx = config.RETURN_SCAN_X - config.TAKEOFF_PAD_X
+    sy = config.RETURN_SCAN_Y - config.TAKEOFF_PAD_Y
+    _navigate_to(cf, shared, hub, occ, hmap, sx, sy, config.FLIGHT_Z, config.NAV_SPEED)
+
+    data = _step(shared, hub, occ, hmap)
+    print(f'[return_scan] scanning from ({data.pose[0]:.2f}, {data.pose[1]:.2f})'
+          f'  target=({sx:.2f}, {sy:.2f})')
+
+    occ_scan_high = OccupancyGrid()
+    do_rotation_scan(cf, shared, hub, occ, hmap,
+                     angle_deg=180.0,
+                     occ_target=occ_scan_high,
+                     state='SCAN_HIGH')
+    shared.occ_scan_high_grid = occ_scan_high.snapshot(filter_outliers=False)
+
+    occ_low = OccupancyGrid()
+    controller.takeoff_vel(cf, config.LOW_SCAN_Z, speed=0.15, settle=0.5)
+    do_rotation_scan(cf, shared, hub, occ, hmap,
+                     angle_deg=180.0,
+                     occ_target=occ_low,
+                     scan_z=config.LOW_SCAN_Z,
+                     freeze_occ=True,
+                     state='SCAN_LOW')
+    shared.occ_low_grid = occ_low.snapshot(filter_outliers=False)
+    controller.takeoff_vel(cf, config.FLIGHT_Z, speed=0.15, settle=0.5)
+
+    pad_pos, diff_grid = find_pad_from_diff(occ_scan_high, occ_low)
+    shared.occ_diff_grid = diff_grid
+    if pad_pos is not None:
+        print(f'[return_scan] takeoff pad at EKF ({pad_pos[0]:.3f}, {pad_pos[1]:.3f})')
+    else:
+        print('[return_scan] takeoff pad not found')
+    return pad_pos
+
+
 def do_land_on_start(cf, shared, hub, occ, hmap):
     shared.current_state = 'LANDING_ON_START'
     hx, hy = shared.home_pos
-    _navigate_to(cf, shared, hub, occ, hmap,
-                 hx, hy, config.FLIGHT_Z, config.SCAN_SPEED)
-    controller.land_vel(cf, hub)
+    do_land_on_pad(cf, shared, hub, occ, hmap, hx, hy,
+                   yaw_align=False, entry_overshoot=0.08)
     shared.current_state = 'DONE'
 
 

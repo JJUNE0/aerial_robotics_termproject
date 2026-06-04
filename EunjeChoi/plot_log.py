@@ -195,7 +195,10 @@ def plot(df: pd.DataFrame, title: str, occ_data=None):
                 tdf['target_y_m'] + config.TAKEOFF_PAD_Y,
             ))
 
-    entries, exits = detect_edges(df, states={'LANDING_ON_PAD'})
+    entries, exits = detect_edges(df, states={
+        'LANDING_ON_PAD', 'LAND_APPROACH', 'LAND_ENTRY',
+        'LANDING_ON_START',
+    })
     # Apply arena offset to edge event positions
     entries = [(te, ex + config.TAKEOFF_PAD_X, ey + config.TAKEOFF_PAD_Y)
                for te, ex, ey in entries]
@@ -217,16 +220,26 @@ def plot(df: pd.DataFrame, title: str, occ_data=None):
 
     ax1.plot(t, z, color='#1a6faf', lw=1.2, zorder=2, label='z_down')
 
-    # baseline
+    # baseline + entry/exit thresholds
     ax1.axhline(config.EDGE_BASELINE, color='#888888', lw=1.0, linestyle='--',
                 alpha=0.7, label=f'baseline ({config.EDGE_BASELINE:.2f} m)')
+    entry_thresh = config.EDGE_BASELINE - config.EDGE_ENTRY_DIP
+    exit_thresh  = config.EDGE_BASELINE + config.EDGE_EXIT_RISE
+    ax1.axhline(entry_thresh, color='#cc2222', lw=0.9, linestyle=':',
+                alpha=0.7, label=f'entry thr ({entry_thresh:.2f} m)')
+    ax1.axhline(exit_thresh,  color='#2244cc', lw=0.9, linestyle=':',
+                alpha=0.7, label=f'exit thr ({exit_thresh:.2f} m)')
 
-    for te, *_ in entries:
-        ax1.axvline(te, color='#cc2222', lw=1.2, linestyle='--', alpha=0.9,
-                    label='entry' if te == entries[0][0] else '')
-    for te, *_ in exits:
-        ax1.axvline(te, color='#2244cc', lw=1.2, linestyle=':', alpha=0.9,
-                    label='exit' if te == exits[0][0] else '')
+    for i, (te, *_) in enumerate(entries):
+        idx = np.argmin(np.abs(t - te))
+        ax1.axvline(t[idx], color='#cc2222', lw=1.2, linestyle='--', alpha=0.8,
+                    label='entry detected' if i == 0 else '')
+        ax1.plot(t[idx], z[idx], 'o', color='#cc2222', ms=8, zorder=7)
+    for i, (te, *_) in enumerate(exits):
+        idx = np.argmin(np.abs(t - te))
+        ax1.axvline(t[idx], color='#2244cc', lw=1.2, linestyle='--', alpha=0.8,
+                    label='exit detected' if i == 0 else '')
+        ax1.plot(t[idx], z[idx], 's', color='#2244cc', ms=8, zorder=7)
 
     ax1.set_xlabel('time (s)', color='black')
     ax1.set_ylabel('z_down (m)', color='black')
@@ -263,12 +276,25 @@ def plot(df: pd.DataFrame, title: str, occ_data=None):
                    extent=[x_min, x_max, y_min, y_max],
                    aspect='auto', zorder=1)
 
-    sc = ax2.scatter(x, y, c=z, cmap='Reds',
-                     s=20, vmin=z.min(), vmax=z.max(), zorder=2)
+    # Split trajectory into outward and return phases
+    ret_states = {'RET_WAYPOINT', 'NAV_TO_START', 'LANDING_ON_START', 'DONE'}
+    if 'state' in df.columns:
+        is_ret = df['state'].isin(ret_states).values
+    else:
+        is_ret = np.zeros(len(x), dtype=bool)
+    mask_out = ~is_ret
+    mask_ret = is_ret
+
+    sc = ax2.scatter(x[mask_out], y[mask_out], c=z[mask_out], cmap='Reds',
+                     s=20, vmin=z.min(), vmax=z.max(), zorder=2, label='outward')
     cb = plt.colorbar(sc, ax=ax2, fraction=0.046, pad=0.04)
     cb.set_label('z_down (m)', color='black')
     cb.ax.yaxis.set_tick_params(color='black')
     plt.setp(cb.ax.yaxis.get_ticklabels(), color='black')
+
+    if mask_ret.any():
+        ax2.scatter(x[mask_ret], y[mask_ret], c='#3b82f6',
+                    s=20, zorder=3, label='return', alpha=0.85)
 
     # Frontier targets (unique positions)
     frontiers = []

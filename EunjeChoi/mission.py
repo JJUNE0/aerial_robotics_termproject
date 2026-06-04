@@ -18,7 +18,9 @@ State sequence:
   → LAND_APPROACH    : pad Y 방향 접근
   → LAND_ENTRY       : entry edge 감지됨, 계속 전진
   → LAND_HOVER       : 착지 전 1s 호버
+  → LAND_YAW_ALIGN   : home_yaw+180° 방향으로 회전 후 착지
   → TAKEOFF_FROM_PAD
+  → YAW_ALIGN        : home_yaw+180°로 IMU drift 보정 회전
   → TURN_AROUND
   → NAV_TO_START
       RET_FRONTIER / RET_WAYPOINT / RET_RECOVER_Y / RET_RECOVER_X
@@ -127,9 +129,11 @@ def do_takeoff(cf, shared, hub, occ, hmap):
     controller.takeoff_vel(cf, config.FLIGHT_Z)
     data = _step(shared, hub, occ, hmap)
 
-    # Record stabilised hover position as home — EKF may have drifted during takeoff
+    # Record stabilised hover position and yaw as home reference
     home_x, home_y = data.pose[0], data.pose[1]
     shared.home_pos = (home_x, home_y)
+    shared.home_yaw = data.pose[3]
+    print(f'[takeoff] home pos=({home_x:.2f}, {home_y:.2f})  yaw={data.pose[3]:.1f}°')
     print(f'[mission] home recorded: ({home_x:.3f}, {home_y:.3f})')
 
 
@@ -309,7 +313,7 @@ def _nav_to_x(cf, shared, hub, occ, hmap, target_x: float, prefix: str = 'NAV'):
             break
 
         shared.current_state = f'{prefix}_FRONTIER'
-        target = frontier.find_max_x_target(cx, cy, x_limit=min(target_x, cx + 1.25))
+        target = frontier.find_max_x_target(cx, cy, x_limit=min(target_x, cx + 1.1))
         if target is None or target[0] <= cx + 0.1:
             shared.frontier_target = None
             shared.nav_waypoints = []
@@ -369,7 +373,9 @@ def _nav_to_x(cf, shared, hub, occ, hmap, target_x: float, prefix: str = 'NAV'):
                 break
         shared.nav_waypoints = []
         if nav_ok:
-            do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
+            data = _step(shared, hub, occ, hmap)
+            if data.pose[0] < target_x - 0.20:
+                do_rotation_scan(cf, shared, hub, occ, hmap, angle_deg=90.0)
         else:
             failed_plans += 1
             if failed_plans >= MAX_FAILED:
@@ -414,7 +420,7 @@ def do_landing_region_scan(cf, shared, hub, occ, hmap):
                      angle_deg=180.0,
                      occ_target=occ_scan_high,
                      state='SCAN_HIGH')
-    shared.occ_scan_high_grid = occ_scan_high.snapshot()
+    shared.occ_scan_high_grid = occ_scan_high.snapshot(filter_outliers=False)
 
     # ── Pass 2: LOW_SCAN_Z
     occ_low = OccupancyGrid()
@@ -426,7 +432,7 @@ def do_landing_region_scan(cf, shared, hub, occ, hmap):
                      scan_z=config.LOW_SCAN_Z,
                      freeze_occ=True,
                      state='SCAN_LOW')
-    shared.occ_low_grid = occ_low.snapshot()
+    shared.occ_low_grid = occ_low.snapshot(filter_outliers=False)
 
     controller.takeoff_vel(cf, config.FLIGHT_Z, speed=0.15, settle=0.5)
 
@@ -482,7 +488,13 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     _, cy, _, _ = data.pose
     shared.landing_align_pos = (pad_x, cy)
     _navigate_to(cf, shared, hub, occ, hmap,
-                 pad_x, cy, config.FLIGHT_Z, config.NAV_SPEED)
+                 pad_x, cy, config.FLIGHT_Z, config.PAD_LAND_X_SPEED)
+
+    # Hover 1s to stabilise before approaching pad
+    end_hover = time.time() + 1.0
+    while time.time() < end_hover:
+        cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+        time.sleep(config.DT)
 
     # Step 2: search past the estimated entry edge; if entry is detected,
     # move a fixed distance from that measured edge before landing.
@@ -562,13 +574,41 @@ def do_land_on_pad(cf, shared, hub, occ, hmap, pad_x: float, pad_y: float):
     shared.current_state = 'LAND_HOVER'
     cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
     time.sleep(1.0)
+
+    # Rotate to face back toward start (-179.9° = just below ±180 boundary)
+    land_yaw = -179.9
+    shared.current_state = 'LAND_YAW_ALIGN'
+    data = _step(shared, hub, occ, hmap)
+    current_yaw = data.pose[3]
+    hold_x, hold_y = data.pose[0], data.pose[1]
+    delta = ((land_yaw - current_yaw) + 180.0) % 360.0 - 180.0
+    print(f'[land] yaw align: target={land_yaw:.1f}°  current={current_yaw:.1f}°  delta={delta:+.1f}°')
+    if abs(delta) > 1.0:
+        hold_kp = 2.0
+        max_xy  = 0.10
+        timeout = time.time() + abs(delta) / config.SCAN_ROTATE_RATE * 4.0
+        while time.time() < timeout:
+            data = _step(shared, hub, occ, hmap)
+            cx, cy, _, cyaw = data.pose
+            delta = ((land_yaw - cyaw) + 180.0) % 360.0 - 180.0
+            if abs(delta) < 1.0:
+                break
+            yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, delta)
+            vx_w = max(-max_xy, min(max_xy, (hold_x - cx) * hold_kp))
+            vy_w = max(-max_xy, min(max_xy, (hold_y - cy) * hold_kp))
+            vx_b, vy_b = controller.vel_to_body(vx_w, vy_w, cyaw)
+            cf.commander.send_hover_setpoint(vx_b, vy_b, yaw_rate, config.FLIGHT_Z)
+            time.sleep(config.DT)
+        cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+        time.sleep(0.5)
+
     shared.target_pos = None
     controller.land_vel(cf, hub)
 
 
 def do_takeoff_from_pad(cf, shared, hub, occ, hmap):
     shared.current_state = 'TAKEOFF_FROM_PAD'
-    # Re-arm after landing on pad
+    # Re-arm after landing on pad (no EKF reset — preserve yaw estimate)
     for _ in range(20):
         if cf.supervisor.can_be_armed:
             break
@@ -577,6 +617,46 @@ def do_takeoff_from_pad(cf, shared, hub, occ, hmap):
     time.sleep(0.5)
     controller.takeoff_vel(cf, config.FLIGHT_Z)
     _step(shared, hub, occ, hmap)
+
+
+# ------------------------------------------------------------------ yaw alignment
+
+def do_yaw_align(cf, shared, hub, occ, hmap, target_yaw: float):
+    """Rotate to recover target_yaw saved before landing.
+
+    target_yaw: circular mean of the last N yaw readings before landing (deg).
+    Corrects IMU drift that accumulates while the drone is disarmed on the pad.
+    """
+    shared.current_state = 'YAW_ALIGN'
+    data = _step(shared, hub, occ, hmap)
+    current_yaw = data.pose[3]
+    delta = ((target_yaw - current_yaw) + 180.0) % 360.0 - 180.0  # [-180, 180]
+    print(f'[yaw_align] target={target_yaw:.1f}°  current={current_yaw:.1f}°  delta={delta:+.1f}°')
+
+    if abs(delta) < 1.0:
+        print('[yaw_align] within ±1°, no correction needed')
+        return
+
+    hold_x, hold_y = data.pose[0], data.pose[1]
+    hold_kp = 2.0
+    max_xy  = 0.10
+    timeout = time.time() + abs(delta) / config.SCAN_ROTATE_RATE * 4.0
+    while time.time() < timeout:
+        data = _step(shared, hub, occ, hmap)
+        cx, cy, _, current_yaw = data.pose
+        delta = ((target_yaw - current_yaw) + 180.0) % 360.0 - 180.0
+        if abs(delta) < 1.0:
+            break
+        yaw_rate = math.copysign(config.SCAN_ROTATE_RATE, delta)
+        vx_w = max(-max_xy, min(max_xy, (hold_x - cx) * hold_kp))
+        vy_w = max(-max_xy, min(max_xy, (hold_y - cy) * hold_kp))
+        vx_b, vy_b = controller.vel_to_body(vx_w, vy_w, current_yaw)
+        cf.commander.send_hover_setpoint(vx_b, vy_b, yaw_rate, config.FLIGHT_Z)
+        time.sleep(config.DT)
+    cf.commander.send_hover_setpoint(0, 0, 0, config.FLIGHT_Z)
+    time.sleep(0.5)
+    data = _step(shared, hub, occ, hmap)
+    print(f'[yaw_align] yaw after correction: {data.pose[3]:.1f}°')
 
 
 def do_turn_around(cf, shared, hub, occ, hmap):
@@ -604,7 +684,7 @@ def _nav_to_home(cf, shared, hub, occ_return: OccupancyGrid, hmap, home_x: float
             break
 
         shared.current_state = 'RET_FRONTIER'
-        target = frontier.find_min_x_target(cx, cy, x_limit=max(home_x, cx - 1.25))
+        target = frontier.find_min_x_target(cx, cy, x_limit=max(home_x, cx - 1.1))
         if target is None or target[0] >= cx - 0.1:
             shared.frontier_target = None
             shared.nav_waypoints = []
@@ -678,15 +758,11 @@ def _nav_to_home(cf, shared, hub, occ_return: OccupancyGrid, hmap, home_x: float
 
 def do_nav_to_start(cf, shared, hub, _occ, hmap):
     shared.current_state = 'NAV_TO_START'
-    rx = config.RETURN_SCAN_X - config.TAKEOFF_PAD_X   # EKF coords
-    ry = config.RETURN_SCAN_Y - config.TAKEOFF_PAD_Y
     occ_return = OccupancyGrid()
-    _nav_to_home(cf, shared, hub, occ_return, hmap, rx)
-    shared.current_state = 'NAV_TO_START'
-    _navigate_to(cf, shared, hub, occ_return, hmap,
-                 rx, ry, config.FLIGHT_Z, config.NAV_SPEED)
-    do_rotation_scan(cf, shared, hub, occ_return, hmap,
-                     angle_deg=180.0, state='RETURN_SCAN')
+    # Initial rotation scan to seed the return map
+    do_rotation_scan(cf, shared, hub, occ_return, hmap)
+    home_x = 1.0 - config.TAKEOFF_PAD_X   # arena X=1.0 → EKF X=0.0
+    _nav_to_home(cf, shared, hub, occ_return, hmap, home_x)
     shared.current_state = 'NAV_TO_START'
     shared.occ_return_grid = occ_return.snapshot()
 
@@ -720,7 +796,6 @@ def run_mission(cf, shared: SharedState):
             do_takeoff_from_pad(cf, shared, hub, occ, hmap)
         else:
             print('[mission] pad not found — skipping pad landing, returning home')
-        do_turn_around(cf, shared, hub, occ, hmap)
         do_nav_to_start(cf, shared, hub, occ, hmap)
         do_land_on_start(cf, shared, hub, occ, hmap)
 

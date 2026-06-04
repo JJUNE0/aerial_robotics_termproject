@@ -18,11 +18,12 @@ def _passable(grid: np.ndarray, row: int, col: int) -> bool:
 def astar(grid: np.ndarray,
           start: Tuple[int, int],
           goal: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
-    """A* on occupancy grid — 4-directional only, clearance-weighted cost.
+    """A* on occupancy grid — 8-directional, clearance-weighted cost.
 
-    Cardinal-only movement ensures each path segment is purely horizontal or
-    vertical, so the drone never yaws during navigation.  Clearance cost biases
-    A* toward the centre of corridors (away from INFLATED/OCCUPIED cells).
+    Diagonal moves (cost √2) reduce staircase patterns so simplify_path
+    collapses them into far fewer waypoints.  Corner-cutting through
+    obstacles is prevented: both cardinal neighbours of a diagonal step
+    must be passable.  Clearance cost biases paths toward open corridors.
     """
     sr, sc = start
     gr, gc = goal
@@ -32,16 +33,20 @@ def astar(grid: np.ndarray,
         return None
 
     def h(r: int, c: int) -> float:
-        return abs(r - gr) + abs(c - gc)  # Manhattan — consistent with 4-dir
+        return abs(r - gr) + abs(c - gc)  # Manhattan
 
     def clearance_penalty(r: int, c: int) -> float:
         pen = 0.0
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
+        rad = config.A_STAR_CLEARANCE_RADIUS
+        w   = config.A_STAR_CLEARANCE_WEIGHT
+        for dr in range(-rad, rad + 1):
+            for dc in range(-rad, rad + 1):
+                if dr == 0 and dc == 0:
+                    continue
                 nr, nc = r + dr, c + dc
                 if (0 <= nr < rows and 0 <= nc < cols and
                         grid[nr, nc] in (OCCUPIED, INFLATED)):
-                    pen += 0.2
+                    pen += w / math.sqrt(dr * dr + dc * dc)
         return pen
 
     open_heap: list = []
@@ -75,24 +80,80 @@ def astar(grid: np.ndarray,
     return None
 
 
+def _segment_clear(grid: np.ndarray, a: Tuple[int, int], b: Tuple[int, int]) -> bool:
+    """Check every cell on the horizontal or vertical line from a to b."""
+    r0, c0 = a
+    r1, c1 = b
+    if r0 == r1:
+        for c in range(min(c0, c1), max(c0, c1) + 1):
+            if not _passable(grid, r0, c):
+                return False
+    else:
+        for r in range(min(r0, r1), max(r0, r1) + 1):
+            if not _passable(grid, r, c1):
+                return False
+    return True
+
+
+def _l_via(grid: np.ndarray,
+           a: Tuple[int, int], b: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+    """Return a via-point for an L-shaped path from a to b, or None if impossible.
+
+    Tries H-then-V and V-then-H.  Returns the via-point, or b itself if a
+    direct (same-row/col) segment is clear.
+    """
+    ra, ca = a
+    rb, cb = b
+    if ra == rb or ca == cb:
+        return b if _segment_clear(grid, a, b) else None
+    via_hv = (ra, cb)   # go horizontal first
+    if _segment_clear(grid, a, via_hv) and _segment_clear(grid, via_hv, b):
+        return via_hv
+    via_vh = (rb, ca)   # go vertical first
+    if _segment_clear(grid, a, via_vh) and _segment_clear(grid, via_vh, b):
+        return via_vh
+    return None
+
+
 def simplify_path(path: List[Tuple[int, int]],
                   grid: np.ndarray) -> List[Tuple[int, int]]:
-    """Merge consecutive collinear steps — keeps only direction-change points.
+    """Collinear merge + greedy L-shape skip.
 
-    With 4-directional A*, each segment is already horizontal or vertical.
-    This collapses a run of same-direction steps into one direct waypoint so
-    the drone flies each cardinal leg in a single _navigate_to call.
+    After collapsing collinear steps, greedily skip from the current
+    anchor to the farthest waypoint reachable via a single L-shaped
+    path (H-then-V or V-then-H).  This turns many small staircase
+    steps into one large L-shaped move whenever the corridor is free.
     """
     if len(path) <= 2:
         return path
+
+    # Step 1: collinear merge
     simplified = [path[0]]
     for i in range(1, len(path) - 1):
-        d1 = (path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1])
-        d2 = (path[i + 1][0] - path[i][0],  path[i + 1][1] - path[i][1])
+        d1 = (path[i][0] - path[i-1][0], path[i][1] - path[i-1][1])
+        d2 = (path[i+1][0] - path[i][0],  path[i+1][1] - path[i][1])
         if d1 != d2:
             simplified.append(path[i])
     simplified.append(path[-1])
-    return simplified
+    path = simplified
+
+    # Step 2: greedy L-shape skip
+    result = [path[0]]
+    i = 0
+    while i < len(path) - 1:
+        # Search backwards for the farthest reachable waypoint via L-shape
+        j = len(path) - 1
+        while j > i + 1:
+            if _l_via(grid, path[i], path[j]) is not None:
+                break
+            j -= 1
+        via = _l_via(grid, path[i], path[j])
+        if via is not None and via != path[j]:
+            result.append(via)
+        result.append(path[j])
+        i = j
+
+    return result
 
 
 class FrontierNavigator:
@@ -111,7 +172,6 @@ class FrontierNavigator:
         if not (0 <= sr < rows and 0 <= sc < cols):
             return None
 
-        # If we have an x limit, compute the column limit
         limit_col = cols - 1
         if x_limit is not None:
             lc = int((x_limit - self._occ.x_min) / self._occ.res)
@@ -127,7 +187,6 @@ class FrontierNavigator:
         while queue:
             r, c = queue.popleft()
 
-            # Only FREE cells count as valid destinations
             if grid[r, c] == FREE and c > sc:
                 if not found or c > best_col or (
                         c == best_col and
@@ -143,8 +202,6 @@ class FrontierNavigator:
                     nr, nc = r + dr, c + dc
                     if nc > limit_col:
                         continue
-                    # Traverse FREE cells only — prevents selecting targets
-                    # that are only reachable through unknown or inflated space
                     if (0 <= nr < rows and 0 <= nc < cols and
                             not visited[nr, nc] and
                             grid[nr, nc] == FREE):

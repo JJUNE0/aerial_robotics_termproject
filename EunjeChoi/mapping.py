@@ -47,6 +47,14 @@ class OccupancyGrid:
         self._grid[ay0:ay1, ax0:ax0 + margin_cells] = INFLATED
         self._grid[ay0:ay1, ax1 - margin_cells:ax1] = INFLATED
 
+        # Boundary mask — keeps track of pre-inflated boundary cells so they
+        # are preserved when the snapshot filter rebuilds inflation.
+        self._boundary_mask = np.zeros((rows, cols), dtype=bool)
+        self._boundary_mask[ay0:ay0 + margin_cells, ax0:ax1] = True
+        self._boundary_mask[ay1 - margin_cells:ay1, ax0:ax1] = True
+        self._boundary_mask[ay0:ay1, ax0:ax0 + margin_cells] = True
+        self._boundary_mask[ay0:ay1, ax1 - margin_cells:ax1] = True
+
     # -------------------------------------------------------- coord helpers
 
     def world_to_cell(self, x: float, y: float) -> Tuple[int, int]:
@@ -160,9 +168,60 @@ class OccupancyGrid:
         for offset, dist in directions:
             self.update_ray(drone_x, drone_y, yaw_deg + offset, dist)
 
-    def snapshot(self) -> np.ndarray:
+    def snapshot(self, filter_outliers: bool = True) -> np.ndarray:
         with self._lock:
-            return self._grid.copy()
+            grid = self._grid.copy()
+            boundary = self._boundary_mask
+
+        min_cells = config.OCC_MIN_COMPONENT_CELLS
+        if not filter_outliers or min_cells <= 1:
+            return grid
+
+        # BFS to find connected components of OCCUPIED cells (4-connectivity).
+        # Components smaller than min_cells are noise → remove from the copy.
+        occ_mask = (grid == OCCUPIED)
+        rows, cols = grid.shape
+        visited = np.zeros((rows, cols), dtype=bool)
+        small_cells = []
+
+        for sr in range(rows):
+            for sc in range(cols):
+                if not occ_mask[sr, sc] or visited[sr, sc]:
+                    continue
+                component = []
+                stack = [(sr, sc)]
+                visited[sr, sc] = True
+                while stack:
+                    r, c = stack.pop()
+                    component.append((r, c))
+                    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        nr, nc = r + dr, c + dc
+                        if (0 <= nr < rows and 0 <= nc < cols
+                                and occ_mask[nr, nc] and not visited[nr, nc]):
+                            visited[nr, nc] = True
+                            stack.append((nr, nc))
+                if len(component) < min_cells:
+                    small_cells.extend(component)
+
+        if not small_cells:
+            return grid
+
+        # Remove small components and rebuild inflation without them.
+        for r, c in small_cells:
+            grid[r, c] = FREE
+
+        # Reset non-boundary INFLATED cells, then re-inflate from surviving OCCUPIED.
+        grid[(grid == INFLATED) & ~boundary] = FREE
+        rad = self._inflation_cells
+        for er, ec in zip(*np.where(grid == OCCUPIED)):
+            for dr in range(-rad, rad + 1):
+                for dc in range(-rad, rad + 1):
+                    if dr * dr + dc * dc <= rad * rad:
+                        nr, nc = int(er) + dr, int(ec) + dc
+                        if 0 <= nr < rows and 0 <= nc < cols and grid[nr, nc] == FREE:
+                            grid[nr, nc] = INFLATED
+
+        return grid
 
 
 def find_pad_from_diff(occ_high: 'OccupancyGrid',
@@ -196,7 +255,8 @@ def find_pad_from_diff(occ_high: 'OccupancyGrid',
             while queue:
                 r, c = queue.pop()
                 component.append((r, c))
-                for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+                for dr, dc in ((-1,0),(1,0),(0,-1),(0,1),
+                                (-1,-1),(-1,1),(1,-1),(1,1)):
                     nr, nc = r+dr, c+dc
                     if (0 <= nr < rows and 0 <= nc < cols
                             and diff[nr, nc] and not visited[nr, nc]):
@@ -248,7 +308,8 @@ def compute_diff_clusters(diff_array: np.ndarray, res: float) -> list:
             while queue:
                 r, c = queue.pop()
                 component.append((r, c))
-                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                                (-1, -1), (-1, 1), (1, -1), (1, 1)):
                     nr, nc = r + dr, c + dc
                     if (0 <= nr < rows and 0 <= nc < cols
                             and diff_array[nr, nc] and not visited[nr, nc]):
